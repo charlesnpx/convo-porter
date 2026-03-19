@@ -1,65 +1,123 @@
 # convo-porter
 
-Export and import conversations between **Claude Code** and **OpenAI Codex CLI**.
+Transfer conversation context between **Claude Code** and **OpenAI Codex CLI**.
 
-Both tools store sessions as JSONL with different schemas. convo-porter parses either format into portable markdown that can be imported into the other tool as background context.
+Both tools store sessions as JSONL with different schemas. convo-porter parses either format and injects it into the other tool's native session format, so context carries over seamlessly when switching between tools.
 
 ## Install
 
 ```bash
-./install.sh
+pipx install git+https://github.com/charlesnpx/convo-porter.git
+convo-porter install
 ```
 
-This creates symlinks so both tools can find the commands/skills:
-- Claude Code: `/export` and `/import` slash commands
-- Codex CLI: `$convo-porter` and `$convo-import` skills
+The first command installs the `convo-porter` binary. The second writes slash-command and skill templates so both tools can invoke it natively.
+
+Requires Python 3.10+. No external dependencies (stdlib only).
 
 ## Usage
+
+### From Claude Code
+
+Use the `/export-to-codex` slash command:
+
+```
+/export-to-codex              # export current session to a new Codex session
+/export-to-codex --tail 10    # only the last 10 turns
+/export-to-codex abc123       # append to existing Codex session abc123
+```
+
+### From Codex CLI
+
+Use the `$export-to-claude` skill:
+
+```
+$export-to-claude              # export current session to a new Claude session
+$export-to-claude --tail 10    # only the last 10 turns
+$export-to-claude abc123       # append to existing Claude session abc123
+```
 
 ### Direct CLI
 
 ```bash
 # List sessions from both tools
-python3 convo_porter.py list
-python3 convo_porter.py list --source claude --limit 10
+convo-porter list
+convo-porter list --source claude --limit 10
 
-# Export the current session
-python3 convo_porter.py export --current --source claude
+# Export a session to portable markdown
+convo-porter export --current --source claude
+convo-porter export ce68816b --tail 20
+convo-porter export --current --include-thinking
 
-# Export a specific session by ID (prefix match)
-python3 convo_porter.py export ce68816b
+# Inject a session into the other tool's native format
+convo-porter inject --source codex --target claude --current
+convo-porter inject abc123 --source claude --target codex --tail 10
 
-# Export from Codex, last 20 turns only
-python3 convo_porter.py export --current --source codex --tail 20
-
-# Export with thinking blocks included
-python3 convo_porter.py export --current --include-thinking
+# Append to an existing target session
+convo-porter inject --source codex --target claude --current --into def456
 ```
 
-### From Claude Code
+### Commands
 
-```
-/export                     # Export current session
-/export --source codex      # Export most recent Codex session
-/export list                # Browse and pick a session
-/import                     # Browse exports and pick one
-/import path/to/export.md   # Import a specific file
-```
+| Command | Description |
+|---------|-------------|
+| `list` | List available sessions from Claude Code and/or Codex CLI |
+| `export` | Export a session to portable markdown (saved to `~/.claude/exports/`) |
+| `inject` | Parse a session from one tool and write it as a native session in the other |
+| `install` | Write slash-command and skill templates to `~/.claude/` and `~/.codex/` |
 
-### From Codex CLI
+### Common flags
 
-```
-$convo-porter               # Export current session
-$convo-porter list          # Browse sessions
-$convo-import               # Browse exports and pick one
-$convo-import path.md       # Import a specific file
-```
+| Flag | Commands | Description |
+|------|----------|-------------|
+| `--source` | all | Filter by tool: `claude` or `codex` |
+| `--current` | export, inject | Use the current active session (detected via PID) |
+| `--tail N` | export, inject | Only include the last N turns |
+| `--target` | inject | Target tool: `claude` or `codex` |
+| `--into ID` | inject | Append to an existing target session (prefix match) |
+| `--include-thinking` | export, inject | Include thinking/reasoning blocks |
+| `--max-tool-lines` | export, inject | Max lines per tool output (default 50) |
+
+## How it works
+
+1. **Parse** the source session's JSONL into a common intermediate representation (turns with roles, tool calls, and outputs)
+2. **Convert** tool calls between formats (e.g., Codex `function_call` to Claude `tool_use`/`tool_result`)
+3. **Write** the result as a native session file that the target tool can resume
+
+Large tool outputs (>10KB) are persisted to disk with a preview, matching Claude Code's native `tool-results/` format. Base64 image data is stripped automatically.
 
 ## Export format
 
-Exports are markdown files with YAML frontmatter, stored in `~/.claude/exports/` by default. Tool calls are wrapped in `<details>` tags for collapsibility. The format is designed to be human-readable and machine-parseable for import.
+The `export` command produces markdown with YAML frontmatter:
 
-## Requirements
+```markdown
+---
+source: claude-code
+session_id: ce68816b-...
+exported_at: 2026-03-19T12:00:00Z
+cwd: /Users/you/project
+model: claude-opus-4-6
+turns: 12
+---
 
-- Python 3.9+
-- No external dependencies (stdlib only)
+## Turn 1 -- User (10:30:15)
+
+What does this function do?
+
+## Turn 2 -- Assistant (10:30:22)
+
+<details>
+<summary>Tool: Read -- src/main.py</summary>
+
+...
+
+</details>
+
+It handles request routing...
+```
+
+Tool calls are wrapped in collapsible `<details>` tags. Exports are saved to `~/.claude/exports/` by default.
+
+## License
+
+MIT

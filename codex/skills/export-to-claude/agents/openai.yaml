@@ -1,0 +1,7 @@
+interface:
+  display_name: "Export to Claude"
+  short_description: "Transfer current session to Claude Code"
+  default_prompt: "Use $export-to-claude to inject the current session into Claude Code's native format."
+
+policy:
+  allow_implicit_invocation: true

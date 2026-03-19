@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "convo-porter"
+version = "0.1.0"
+description = "Transfer conversations between Claude Code and Codex CLI"
+requires-python = ">=3.10"
+
+[project.scripts]
+convo-porter = "convo_porter:main"

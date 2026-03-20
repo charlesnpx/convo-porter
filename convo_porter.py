@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,7 @@ class Turn:
     content: str
     timestamp: str = ""
     thinking: str = ""
-    tools: list = field(default_factory=list)
+    tools: list[ToolInteraction] = field(default_factory=list)
 
 
 @dataclass
@@ -50,7 +51,7 @@ class ConversationMeta:
 @dataclass
 class Conversation:
     meta: ConversationMeta = field(default_factory=ConversationMeta)
-    turns: list = field(default_factory=list)
+    turns: list[Turn] = field(default_factory=list)
 
 
 # ─── Session Discovery ────────────────────────────────────────────────────────
@@ -259,6 +260,16 @@ def resolve_session(session_id=None, current=False, source=None) -> dict:
     return session
 
 
+def _print_resolved(session: dict) -> None:
+    """Print which session was resolved, so the user can catch mistakes."""
+    sid = session["session_id"][:8]
+    source = session["source"]
+    project = session.get("project", "")
+    display = session.get("display", "")
+    label = display[:60] if display else project
+    print(f"Resolved {source} session {sid} ({label})", file=sys.stderr)
+
+
 # ─── Tool Input Summarization ─────────────────────────────────────────────────
 
 
@@ -452,7 +463,12 @@ CODEX_SYSTEM_MARKERS = (
 
 
 def _is_system_context(text: str) -> bool:
-    """Return True if text looks like Codex system context, not user input."""
+    """Return True if text looks like Codex system context, not user input.
+
+    Fragile: these markers are derived from Codex's current system prompt format.
+    If Codex changes its prompt structure, this heuristic may silently include
+    system context in user turns or silently drop real user input.
+    """
     head = text[:500]
     return any(m in head for m in CODEX_SYSTEM_MARKERS)
 
@@ -786,6 +802,7 @@ def cmd_list(args):
 def cmd_export(args):
     """Export a session to portable markdown."""
     session = resolve_session(args.session_id, args.current, args.source)
+    _print_resolved(session)
 
     # Parse
     source = session["source"]
@@ -883,6 +900,20 @@ def _sanitize_output(text: str, max_lines: int) -> str:
         keep = _PERSIST_THRESHOLD
         text = text[:keep] + "\n[... content truncated ...]\n" + text[-_PREVIEW_SIZE:]
     return text
+
+
+def _atomic_write_jsonl(path: Path, records: list) -> None:
+    """Write records to a JSONL file atomically (temp file + rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 # Maps source tool names → Claude Code tool names for tool_use blocks.
@@ -1050,10 +1081,12 @@ def write_as_claude_session(conv: Conversation, append_to: Optional[dict] = None
                 records.append(rec)
                 prev_uuid = result_uuid
 
-    mode = "a" if append_to else "w"
-    with open(jsonl_path, mode) as f:
-        for rec in records:
-            f.write(json.dumps(rec) + "\n")
+    if append_to:
+        with open(jsonl_path, "a") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+    else:
+        _atomic_write_jsonl(jsonl_path, records)
 
     if not append_to:
         first_user = next((t for t in conv.turns if t.role == "user"), None)
@@ -1165,10 +1198,12 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
                     },
                 })
 
-    mode = "a" if append_to else "w"
-    with open(jsonl_path, mode) as f:
-        for rec in records:
-            f.write(json.dumps(rec) + "\n")
+    if append_to:
+        with open(jsonl_path, "a") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+    else:
+        _atomic_write_jsonl(jsonl_path, records)
 
     return session_id, str(jsonl_path)
 
@@ -1184,6 +1219,7 @@ def cmd_inject(args):
         sys.exit(1)
 
     session = resolve_session(args.session_id, args.current, args.source)
+    _print_resolved(session)
 
     # Parse source
     if session["source"] == "claude":

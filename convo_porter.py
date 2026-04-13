@@ -1295,7 +1295,10 @@ Inject the current Claude Code session into Codex CLI's native session format.
      {binary} inject --current --source claude --target codex --into <session-id>
      ```
 
-3. Report the result: show the Codex session file path.
+3. Report the result from the CLI output. Include:
+   - **Turns** exported (the number from the CLI output)
+   - **Session file** path (the `File:` line from the CLI output)
+   - **Resume command**: copy the `Open:` line from the CLI output verbatim — it is `codex resume <full-uuid>`. Do NOT shorten the UUID and do NOT change the subcommand (it is `resume`, not `--resume`).
 """
 
 _EXPORT_TO_CLAUDE_SKILL = """\

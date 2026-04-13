@@ -23,11 +23,11 @@ Inject the current Claude Code session into Codex CLI's native session format.
 
    - New session:
      ```
-     python3 __REPO_DIR__/convo_porter.py inject --current --source claude --target codex
+     __BINARY__ inject --current --source claude --target codex
      ```
    - Append to existing Codex session:
      ```
-     python3 __REPO_DIR__/convo_porter.py inject --current --source claude --target codex --into <session-id>
+     __BINARY__ inject --current --source claude --target codex --into <session-id>
      ```
 
 3. Report the result from the CLI output. Include:

@@ -1139,7 +1139,7 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
                 "originator": "convo_porter", "cli_version": "0.0.0",
                 "source": "import", "model_provider": "anthropic",
                 "git": {"commit_hash": "", "branch": git_branch},
-                "base_instructions": {"text": ""},
+                "base_instructions": {"text": "You are a coding agent. Continue the imported conversation."},
             },
         })
         records.append({

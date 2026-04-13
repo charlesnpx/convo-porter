@@ -1262,115 +1262,47 @@ def cmd_inject(args):
 # ─── Install Command ──────────────────────────────────────────────────────────
 
 
-_EXPORT_TO_CODEX_MD = """\
----
-name: export-to-codex
-description: |
-  Export the current Claude Code session into Codex CLI as a native session.
-  Use when transferring context to Codex or continuing work there.
-allowed-tools:
-  - Bash
-argument-hint: "[target-codex-session-id] [--tail N]"
----
+def _bundle_dir() -> Path:
+    """Resolve the bundled skill/command directory (works both in dev and installed)."""
+    return Path(__file__).resolve().parent
 
-# Export to Codex
 
-Inject the current Claude Code session into Codex CLI's native session format.
-
-## Workflow
-
-1. Parse the user's arguments:
-   - **No arguments**: create a new Codex session.
-   - **A session ID**: append to that existing Codex session. Pass it as `--into <id>`.
-   - **`--tail N`**: only export the last N turns.
-
-2. Build and run the command:
-
-   - New session:
-     ```
-     {binary} inject --current --source claude --target codex
-     ```
-   - Append to existing Codex session:
-     ```
-     {binary} inject --current --source claude --target codex --into <session-id>
-     ```
-
-3. Report the result from the CLI output. Include:
-   - **Turns** exported (the number from the CLI output)
-   - **Session file** path (the `File:` line from the CLI output)
-   - **Resume command**: copy the `Open:` line from the CLI output verbatim — it is `codex resume <full-uuid>`. Do NOT shorten the UUID and do NOT change the subcommand (it is `resume`, not `--resume`).
-"""
-
-_EXPORT_TO_CLAUDE_SKILL = """\
----
-name: export-to-claude
-description: >
-  Export the current Codex session into Claude Code as a native session.
-  Use when the user wants to transfer context to Claude Code or continue
-  work there. Trigger on: export to claude, send to claude, transfer to
-  claude, porter.
-argument-hint: "[target-claude-session-id] [--tail N]"
----
-
-# Export to Claude
-
-Inject the current Codex session into Claude Code's native session format.
-
-## Workflow
-
-1. Parse the user's arguments:
-   - **No arguments**: create a new Claude Code session.
-   - **A session ID**: append to that existing Claude Code session. Pass it as `--into <id>`.
-   - **`--tail N`**: only export the last N turns.
-
-2. Run the inject command:
-
-   - New session:
-     ```
-     {binary} inject --current --source codex --target claude
-     ```
-   - Append to existing Claude session:
-     ```
-     {binary} inject --current --source codex --target claude --into <session-id>
-     ```
-
-3. Report the result: show the `claude --resume <id>` command so the user can open it.
-"""
-
-_OPENAI_YAML = """\
-interface:
-  display_name: "Export to Claude"
-  short_description: "Transfer current session to Claude Code"
-  default_prompt: "Use $export-to-claude to inject the current session into Claude Code's native format."
-
-policy:
-  allow_implicit_invocation: true
-"""
+def _install_file(src: Path, dst: Path, binary: str) -> None:
+    """Copy a bundled template file, substituting __BINARY__ with the real path."""
+    text = src.read_text()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(text.replace("__BINARY__", binary))
+    print(f"  Installed {dst}")
 
 
 def cmd_install(args):
     """Install slash-command and skill templates for Claude Code and Codex CLI."""
     binary = shutil.which("convo-porter")
     if not binary:
-        # Fallback: assume we're running from source
         binary = f"python3 {Path(__file__).resolve()}"
 
+    bundle = _bundle_dir()
+
     # Claude Code command
-    dst = CLAUDE_DIR / "commands" / "export-to-codex.md"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(_EXPORT_TO_CODEX_MD.format(binary=binary))
-    print(f"  Installed {dst}")
+    _install_file(
+        bundle / "claude" / "commands" / "export-to-codex.md",
+        CLAUDE_DIR / "commands" / "export-to-codex.md",
+        binary,
+    )
 
     # Codex skill
-    skill_dir = CODEX_DIR / "skills" / "export-to-claude"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(_EXPORT_TO_CLAUDE_SKILL.format(binary=binary))
-    print(f"  Installed {skill_dir / 'SKILL.md'}")
+    _install_file(
+        bundle / "codex" / "skills" / "export-to-claude" / "SKILL.md",
+        CODEX_DIR / "skills" / "export-to-claude" / "SKILL.md",
+        binary,
+    )
 
-    agents_dir = skill_dir / "agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    (agents_dir / "openai.yaml").write_text(_OPENAI_YAML)
-    print(f"  Installed {agents_dir / 'openai.yaml'}")
+    # Codex agent config (no substitution needed, but copy for consistency)
+    src = bundle / "codex" / "skills" / "export-to-claude" / "agents" / "openai.yaml"
+    dst = CODEX_DIR / "skills" / "export-to-claude" / "agents" / "openai.yaml"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    print(f"  Installed {dst}")
 
     print()
     print("Done. Available commands:")

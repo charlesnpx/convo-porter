@@ -1256,6 +1256,7 @@ def cmd_inject(args):
         sid, path = write_as_codex_session(conv, append_to=append_to, max_tool_lines=mtl)
         print(f"{verb} {len(exportable)} turns to Codex session {sid[:8]}")
         print(f"  File: {path}")
+        print(f"  Open: codex resume {sid}")
 
 
 # ─── Install Command ──────────────────────────────────────────────────────────

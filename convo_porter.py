@@ -1302,15 +1302,22 @@ def _render_template(src: Path, dst: Path, binary: str) -> None:
     dst.write_text(text.replace("__BINARY__", binary))
 
 
-def _target_specs(target: str = "all") -> dict[str, list[tuple[Path, Path, bool]]]:
+def _home_for_install(install_root: str | None) -> Path:
+    return Path(install_root).expanduser().resolve() if install_root else Path.home()
+
+
+def _target_specs(target: str = "all", install_root: str | None = None) -> dict[str, list[tuple[Path, Path, bool]]]:
     bundle = _bundle_dir()
+    home = _home_for_install(install_root)
+    claude_dir = home / ".claude" if install_root else CLAUDE_DIR
+    codex_dir = home / ".codex" if install_root else CODEX_DIR
     specs = {
         "claude": [
-            (bundle / "claude" / "commands" / "export-to-codex.md", CLAUDE_DIR / "commands" / "export-to-codex.md", True),
+            (bundle / "claude" / "commands" / "export-to-codex.md", claude_dir / "commands" / "export-to-codex.md", True),
         ],
         "codex": [
-            (bundle / "codex" / "skills" / "export-to-claude" / "SKILL.md", CODEX_DIR / "skills" / "export-to-claude" / "SKILL.md", True),
-            (bundle / "codex" / "skills" / "export-to-claude" / "agents" / "openai.yaml", CODEX_DIR / "skills" / "export-to-claude" / "agents" / "openai.yaml", False),
+            (bundle / "codex" / "skills" / "export-to-claude" / "SKILL.md", codex_dir / "skills" / "export-to-claude" / "SKILL.md", True),
+            (bundle / "codex" / "skills" / "export-to-claude" / "agents" / "openai.yaml", codex_dir / "skills" / "export-to-claude" / "agents" / "openai.yaml", False),
         ],
     }
     if target == "all":
@@ -1318,7 +1325,13 @@ def _target_specs(target: str = "all") -> dict[str, list[tuple[Path, Path, bool]
     return {target: specs[target]}
 
 
-def delegated_install_result(operation: str, target: str = "all", *, perform: bool = False) -> dict:
+def delegated_install_result(
+    operation: str,
+    target: str = "all",
+    *,
+    perform: bool = False,
+    install_root: str | None = None,
+) -> dict:
     binary = _binary_command()
     result = {
         "schema": 1,
@@ -1329,7 +1342,7 @@ def delegated_install_result(operation: str, target: str = "all", *, perform: bo
         "targets": {},
         "warnings": [],
     }
-    for target_name, specs in _target_specs(target).items():
+    for target_name, specs in _target_specs(target, install_root).items():
         files = []
         for src, dst, is_template in specs:
             if operation == "install" and perform:
@@ -1356,7 +1369,12 @@ def cmd_install(args):
     elif getattr(args, "uninstall", False):
         operation = "uninstall"
     target = getattr(args, "target", "all")
-    result = delegated_install_result(operation, target, perform=operation != "plan")
+    result = delegated_install_result(
+        operation,
+        target,
+        perform=operation != "plan",
+        install_root=getattr(args, "install_root", None),
+    )
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2))
         return
@@ -1391,6 +1409,7 @@ def main():
     op.add_argument("--install", action="store_true", help="Install skill files (default)")
     op.add_argument("--uninstall", action="store_true", help="Remove skill files")
     ip_install.add_argument("--json", action="store_true", help="Emit mise-en-place delegated-installer JSON on stdout")
+    ip_install.add_argument("--install-root", help="Stage install under this absolute directory as if it were HOME")
 
     # list
     lp = sub.add_parser("list", help="List available sessions")

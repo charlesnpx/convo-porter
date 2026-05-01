@@ -9,9 +9,13 @@ Both tools store sessions as JSONL with different schemas. convo-porter parses e
 ```bash
 pipx install git+https://github.com/charlesnpx/convo-porter.git
 convo-porter install
+convo-porter install --install --target all --json --install-root /tmp/porter-skill-stage
 ```
 
 The first command installs the `convo-porter` binary. The second writes slash-command and skill templates so both tools can invoke it natively.
+`--install-root` is for delegated installers such as `mise-en-place`; it stages
+files under the supplied directory as if it were `$HOME` and reports those
+staged absolute paths in JSON.
 
 Requires Python 3.10+. No external dependencies (stdlib only).
 

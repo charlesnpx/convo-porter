@@ -2,6 +2,7 @@
 """convo-porter: Export conversations between Claude Code and Codex CLI to portable markdown."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from importlib import metadata as importlib_metadata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1267,47 +1269,108 @@ def _bundle_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _install_file(src: Path, dst: Path, binary: str) -> None:
-    """Copy a bundled template file, substituting __BINARY__ with the real path."""
+def _version() -> str:
+    try:
+        return importlib_metadata.version("convo-porter")
+    except importlib_metadata.PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parent / "pyproject.toml"
+        try:
+            import tomllib
+            return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+        except Exception:
+            return "0.0.0"
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _binary_command() -> str:
+    binary = shutil.which("convo-porter")
+    if binary:
+        return binary
+    return f"python3 {Path(__file__).resolve()}"
+
+
+def _render_template(src: Path, dst: Path, binary: str) -> None:
     text = src.read_text()
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text.replace("__BINARY__", binary))
-    print(f"  Installed {dst}")
+
+
+def _target_specs(target: str = "all") -> dict[str, list[tuple[Path, Path, bool]]]:
+    bundle = _bundle_dir()
+    specs = {
+        "claude": [
+            (bundle / "claude" / "commands" / "export-to-codex.md", CLAUDE_DIR / "commands" / "export-to-codex.md", True),
+        ],
+        "codex": [
+            (bundle / "codex" / "skills" / "export-to-claude" / "SKILL.md", CODEX_DIR / "skills" / "export-to-claude" / "SKILL.md", True),
+            (bundle / "codex" / "skills" / "export-to-claude" / "agents" / "openai.yaml", CODEX_DIR / "skills" / "export-to-claude" / "agents" / "openai.yaml", False),
+        ],
+    }
+    if target == "all":
+        return specs
+    return {target: specs[target]}
+
+
+def delegated_install_result(operation: str, target: str = "all", *, perform: bool = False) -> dict:
+    binary = _binary_command()
+    result = {
+        "schema": 1,
+        "name": "convo-porter",
+        "version": _version(),
+        "operation": operation,
+        "kind": "delegated",
+        "targets": {},
+        "warnings": [],
+    }
+    for target_name, specs in _target_specs(target).items():
+        files = []
+        for src, dst, is_template in specs:
+            if operation == "install" and perform:
+                if is_template:
+                    _render_template(src, dst, binary)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+            elif operation == "uninstall" and perform:
+                dst.unlink(missing_ok=True)
+            rec = {"path": str(dst.resolve())}
+            if operation == "install" and dst.exists():
+                rec["sha256"] = _sha256(dst)
+            files.append(rec)
+        result["targets"][target_name] = {"files": files}
+    return result
 
 
 def cmd_install(args):
     """Install slash-command and skill templates for Claude Code and Codex CLI."""
-    binary = shutil.which("convo-porter")
-    if not binary:
-        binary = f"python3 {Path(__file__).resolve()}"
-
-    bundle = _bundle_dir()
-
-    # Claude Code command
-    _install_file(
-        bundle / "claude" / "commands" / "export-to-codex.md",
-        CLAUDE_DIR / "commands" / "export-to-codex.md",
-        binary,
-    )
-
-    # Codex skill
-    _install_file(
-        bundle / "codex" / "skills" / "export-to-claude" / "SKILL.md",
-        CODEX_DIR / "skills" / "export-to-claude" / "SKILL.md",
-        binary,
-    )
-
-    # Codex agent config (no substitution needed, but copy for consistency)
-    src = bundle / "codex" / "skills" / "export-to-claude" / "agents" / "openai.yaml"
-    dst = CODEX_DIR / "skills" / "export-to-claude" / "agents" / "openai.yaml"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    print(f"  Installed {dst}")
-
-    print()
-    print("Done. Available commands:")
-    print("  Claude Code:  /export-to-codex")
-    print("  Codex CLI:    $export-to-claude")
+    operation = "install"
+    if getattr(args, "plan", False):
+        operation = "plan"
+    elif getattr(args, "uninstall", False):
+        operation = "uninstall"
+    target = getattr(args, "target", "all")
+    result = delegated_install_result(operation, target, perform=operation != "plan")
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
+    for target_name, info in result["targets"].items():
+        print(f"{operation.title()} {target_name}:")
+        for f in info["files"]:
+            print(f"  {f['path']}")
+    if operation == "install":
+        print()
+        print("Done. Available commands:")
+        if target in ("all", "claude"):
+            print("  Claude Code:  /export-to-codex")
+        if target in ("all", "codex"):
+            print("  Codex CLI:    $export-to-claude")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1321,7 +1384,13 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # install
-    sub.add_parser("install", help="Install slash-command and skill templates")
+    ip_install = sub.add_parser("install", help="Install slash-command and skill templates")
+    ip_install.add_argument("--target", choices=["claude", "codex", "all"], default="all")
+    op = ip_install.add_mutually_exclusive_group()
+    op.add_argument("--plan", action="store_true", help="Print intended files without writing")
+    op.add_argument("--install", action="store_true", help="Install skill files (default)")
+    op.add_argument("--uninstall", action="store_true", help="Remove skill files")
+    ip_install.add_argument("--json", action="store_true", help="Emit mise-en-place delegated-installer JSON on stdout")
 
     # list
     lp = sub.add_parser("list", help="List available sessions")

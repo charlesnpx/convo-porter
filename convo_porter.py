@@ -1342,6 +1342,9 @@ def delegated_install_result(
         "targets": {},
         "warnings": [],
     }
+    if target == "tools":
+        result["targets"]["tools"] = {"files": []}
+        return result
     for target_name, specs in _target_specs(target, install_root).items():
         files = []
         for src, dst, is_template in specs:
@@ -1403,7 +1406,7 @@ def main():
 
     # install
     ip_install = sub.add_parser("install", help="Install slash-command and skill templates")
-    ip_install.add_argument("--target", choices=["claude", "codex", "all"], default="all")
+    ip_install.add_argument("--target", choices=["claude", "codex", "tools", "all"], default="all")
     op = ip_install.add_mutually_exclusive_group()
     op.add_argument("--plan", action="store_true", help="Print intended files without writing")
     op.add_argument("--install", action="store_true", help="Install skill files (default)")

@@ -1004,7 +1004,7 @@ def write_as_claude_session(conv: Conversation, append_to: Optional[dict] = None
         prev_uuid = None
 
     git_branch = conv.meta.git_branch or ""
-    model = conv.meta.model or "imported"
+    model = "<synthetic>"
 
     # tool-results dir lives alongside the JSONL: {sessionId}/tool-results/
     tool_results_dir = jsonl_path.parent / session_id / "tool-results"
@@ -1116,7 +1116,6 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
 
     cwd = conv.meta.cwd or str(Path.home())
     git_branch = conv.meta.git_branch or ""
-    model = conv.meta.model or "imported"
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     if append_to:
@@ -1139,7 +1138,7 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
             "payload": {
                 "id": session_id, "timestamp": now_iso, "cwd": cwd,
                 "originator": "convo_porter", "cli_version": "0.0.0",
-                "source": "import", "model_provider": "anthropic",
+                "source": "import",
                 "git": {"commit_hash": "", "branch": git_branch},
                 "base_instructions": {"text": "You are a coding agent. Continue the imported conversation."},
             },
@@ -1147,7 +1146,7 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
         records.append({
             "type": "turn_context",
             "timestamp": now_iso,
-            "payload": {"turn_id": str(uuid_mod.uuid4()), "cwd": cwd, "model": model},
+            "payload": {"turn_id": str(uuid_mod.uuid4()), "cwd": cwd},
         })
 
     for turn in conv.turns:

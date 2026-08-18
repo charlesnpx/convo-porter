@@ -51,7 +51,11 @@ def test_delegated_install_stages_all_templates(tmp_path):
     ]
     assert len(files) == 8
     assert all(path.exists() for path in files)
-    assert all("__BINARY__" not in path.read_text() for path in files if path.name.endswith(".md"))
+    templates = [path.read_text() for path in files if path.name.endswith(".md")]
+    assert all("__BINARY__" not in template for template in templates)
+    assert all("convo-porter inject" in template for template in templates)
+    module_path = str(Path(convo_porter.__file__).resolve())
+    assert all(module_path not in template for template in templates)
 
 
 def test_legacy_codex_skill_cleanup_only_removes_managed_skill(tmp_path, monkeypatch):

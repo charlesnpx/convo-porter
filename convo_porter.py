@@ -1879,10 +1879,8 @@ def _sha256(path: Path) -> str:
 
 
 def _binary_command() -> str:
-    binary = shutil.which("convo-porter")
-    if binary:
-        return binary
-    return f"python3 {Path(__file__).resolve()}"
+    """Return a stable command for templates staged before pipx installation."""
+    return "convo-porter"
 
 
 def _render_template(src: Path, dst: Path, binary: str) -> None:

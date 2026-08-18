@@ -1,0 +1,7 @@
+interface:
+  display_name: "Export to Claude"
+  short_description: "Transfer the current Codex or Cursor conversation to Claude Code"
+  default_prompt: "Use $export-to-claude to inject the current conversation into Claude Code."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Export to Codex"
+  short_description: "Transfer the current Cursor conversation to Codex CLI"
+  default_prompt: "Use $export-to-codex to inject the current conversation into Codex CLI."
+
+policy:
+  allow_implicit_invocation: false

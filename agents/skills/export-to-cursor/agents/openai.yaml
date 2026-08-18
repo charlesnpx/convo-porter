@@ -1,0 +1,7 @@
+interface:
+  display_name: "Export to Cursor"
+  short_description: "Transfer the current Codex conversation to Cursor Agent"
+  default_prompt: "Use $export-to-cursor to inject the current conversation into a new Cursor Agent chat."
+
+policy:
+  allow_implicit_invocation: false

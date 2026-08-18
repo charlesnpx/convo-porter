@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "convo-porter"
-version = "0.1.6"
-description = "Transfer conversations between Claude Code and Codex CLI"
+version = "0.2.0"
+description = "Transfer conversations among Claude Code, Codex CLI, and Cursor Agent"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
@@ -16,4 +16,4 @@ convo-porter = "convo_porter:main"
 
 [tool.hatch.build.targets.wheel.force-include]
 "claude" = "claude"
-"codex" = "codex"
+"agents" = "agents"

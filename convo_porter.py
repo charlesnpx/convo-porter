@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""convo-porter: Export conversations between Claude Code and Codex CLI to portable markdown."""
+"""Transfer conversations among Claude Code, Codex CLI, and Cursor Agent."""
 
 import argparse
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ from typing import Optional
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
+CURSOR_DIR = Path.home() / ".cursor"
 EXPORTS_DIR = CLAUDE_DIR / "exports"
 
 
@@ -161,6 +164,52 @@ def discover_codex_sessions(limit: int = 20) -> list:
     return results
 
 
+def _cursor_workspace_path(cwd: str) -> Path:
+    """Return Cursor's chat bucket for an absolute workspace path."""
+    absolute = os.path.abspath(os.path.expanduser(cwd))
+    digest = hashlib.md5(absolute.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return CURSOR_DIR / "chats" / digest
+
+
+def discover_cursor_sessions(limit: int = 20, cwd: Optional[str] = None) -> list:
+    """Discover Cursor Agent chats from their metadata and SQLite stores."""
+    chats_dir = CURSOR_DIR / "chats"
+    if not chats_dir.exists():
+        return []
+
+    buckets = [_cursor_workspace_path(cwd)] if cwd else list(chats_dir.iterdir())
+    results = []
+    for bucket in buckets:
+        if not bucket.is_dir():
+            continue
+        for chat_dir in bucket.iterdir():
+            if not chat_dir.is_dir():
+                continue
+            meta_path = chat_dir / "meta.json"
+            store_path = chat_dir / "store.db"
+            if not meta_path.exists() or not store_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if meta.get("schemaVersion") != 1 or not meta.get("hasConversation"):
+                    continue
+                timestamp = int(meta.get("updatedAtMs") or store_path.stat().st_mtime * 1000)
+            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+                print(f"warn: could not read Cursor chat {chat_dir}: {e}", file=sys.stderr)
+                continue
+            results.append({
+                "session_id": chat_dir.name,
+                "source": "cursor",
+                "project": meta.get("cwd", ""),
+                "path": str(store_path),
+                "display": meta.get("title", ""),
+                "timestamp": timestamp,
+            })
+
+    results.sort(key=lambda s: s.get("timestamp", 0), reverse=True)
+    return results[:limit]
+
+
 def find_current_claude_session() -> Optional[dict]:
     """Find the current Claude Code session by walking ancestor PIDs."""
     pid = os.getpid()
@@ -206,6 +255,20 @@ def find_current_codex_session() -> Optional[dict]:
     return sessions[0] if sessions else None
 
 
+def find_current_cursor_session() -> Optional[dict]:
+    """Find Cursor's active chat, then fall back to the current workspace."""
+    active_id = os.environ.get("CURSOR_AGENT_CHAT_ID", "").strip()
+    if active_id:
+        matches = [
+            session for session in discover_cursor_sessions(limit=1000)
+            if session["session_id"] == active_id
+        ]
+        if matches:
+            return matches[0]
+    sessions = discover_cursor_sessions(limit=1, cwd=os.getcwd())
+    return sessions[0] if sessions else None
+
+
 # ─── Unified Session Resolution ──────────────────────────────────────────────
 
 
@@ -220,6 +283,8 @@ def resolve_session(session_id=None, current=False, source=None) -> dict:
             session = find_current_claude_session()
         if not session and source in ("codex", None):
             session = find_current_codex_session()
+        if not session and source in ("cursor", None):
+            session = find_current_cursor_session()
         if not session:
             print("Could not detect current session.", file=sys.stderr)
             sys.exit(1)
@@ -231,6 +296,8 @@ def resolve_session(session_id=None, current=False, source=None) -> dict:
             pool.extend(discover_claude_sessions(limit=100))
         if source in ("codex", None):
             pool.extend(discover_codex_sessions(limit=100))
+        if source in ("cursor", None):
+            pool.extend(discover_cursor_sessions(limit=100))
         matches = [s for s in pool if s["session_id"].startswith(session_id)]
         if not matches:
             print(f"Session '{session_id}' not found.", file=sys.stderr)
@@ -247,12 +314,16 @@ def resolve_session(session_id=None, current=False, source=None) -> dict:
         session = find_current_claude_session()
     if not session and source in ("codex", None):
         session = find_current_codex_session()
+    if not session and source in ("cursor", None):
+        session = find_current_cursor_session()
     if not session:
         candidates = []
         if source in ("claude", None):
             candidates.extend(discover_claude_sessions(limit=1))
         if source in ("codex", None):
             candidates.extend(discover_codex_sessions(limit=1))
+        if source in ("cursor", None):
+            candidates.extend(discover_cursor_sessions(limit=1))
         if candidates:
             candidates.sort(key=lambda s: s.get("timestamp", 0), reverse=True)
             session = candidates[0]
@@ -658,6 +729,291 @@ def parse_codex_session(path: str, opts) -> Conversation:
     return conv
 
 
+# ─── Cursor Agent Parser / Minimal Protobuf Wire Codec ─────────────────────
+
+
+def _encode_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("protobuf varints must be non-negative")
+    encoded = bytearray()
+    while value > 0x7F:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _pb_bytes(field_number: int, value: bytes) -> bytes:
+    key = (field_number << 3) | 2
+    return _encode_varint(key) + _encode_varint(len(value)) + value
+
+
+def _pb_string(field_number: int, value: str) -> bytes:
+    return _pb_bytes(field_number, value.encode("utf-8"))
+
+
+def _pb_varint(field_number: int, value: int) -> bytes:
+    return _encode_varint(field_number << 3) + _encode_varint(value)
+
+
+def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data) and shift <= 63:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, offset
+        shift += 7
+    raise ValueError("malformed protobuf varint")
+
+
+def _pb_fields(data: bytes) -> list[tuple[int, int, object]]:
+    """Decode enough protobuf wire types to traverse Cursor's blob graph."""
+    fields = []
+    offset = 0
+    while offset < len(data):
+        key, offset = _decode_varint(data, offset)
+        field_number, wire_type = key >> 3, key & 7
+        if not field_number:
+            raise ValueError("invalid protobuf field number 0")
+        if wire_type == 0:
+            value, offset = _decode_varint(data, offset)
+        elif wire_type == 1:
+            end = offset + 8
+            if end > len(data):
+                raise ValueError("truncated fixed64 protobuf field")
+            value, offset = data[offset:end], end
+        elif wire_type == 2:
+            length, offset = _decode_varint(data, offset)
+            end = offset + length
+            if end > len(data):
+                raise ValueError("truncated length-delimited protobuf field")
+            value, offset = data[offset:end], end
+        elif wire_type == 5:
+            end = offset + 4
+            if end > len(data):
+                raise ValueError("truncated fixed32 protobuf field")
+            value, offset = data[offset:end], end
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire_type}")
+        fields.append((field_number, wire_type, value))
+    return fields
+
+
+def _pb_byte_values(data: bytes, field_number: int) -> list[bytes]:
+    return [
+        value for number, wire_type, value in _pb_fields(data)
+        if number == field_number and wire_type == 2 and isinstance(value, bytes)
+    ]
+
+
+def _pb_first_bytes(data: bytes, field_number: int) -> Optional[bytes]:
+    values = _pb_byte_values(data, field_number)
+    return values[0] if values else None
+
+
+def summarize_cursor_tool(name: str, arguments) -> str:
+    """Produce a portable one-line summary for a Cursor AI SDK tool call."""
+    if isinstance(arguments, dict):
+        for key in ("command", "cmd", "file_path", "path", "query", "pattern"):
+            if key in arguments:
+                value = arguments[key]
+                if isinstance(value, list):
+                    value = " ".join(str(part) for part in value)
+                text = str(value)
+                return text[:200] + ("..." if len(text) > 200 else "")
+        text = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(arguments)
+    return text[:200] + ("..." if len(text) > 200 else "")
+
+
+def _cursor_tool_lookup(root: bytes, load_blob, max_tool_lines: int) -> tuple[dict, list]:
+    """Build generic tool interactions and per-user batches from prompt messages."""
+    lookup: dict[str, ToolInteraction] = {}
+    batches: list[list[str]] = []
+    current_batch: Optional[list[str]] = None
+    for reference in _pb_byte_values(root, 1):
+        if len(reference) != 32:
+            continue
+        try:
+            message = json.loads(load_blob(reference.hex()).decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        role = message.get("role")
+        if role == "user":
+            current_batch = []
+            batches.append(current_batch)
+            continue
+        if role not in ("assistant", "tool"):
+            continue
+        content = message.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            call_id = str(block.get("toolCallId", ""))
+            if not call_id:
+                continue
+            if block_type == "tool-call":
+                name = str(block.get("toolName", "cursor_tool"))
+                lookup[call_id] = ToolInteraction(
+                    tool_name=name,
+                    input_summary=summarize_cursor_tool(name, block.get("args", {})),
+                    call_id=call_id,
+                )
+                if current_batch is not None and call_id not in current_batch:
+                    current_batch.append(call_id)
+            elif block_type == "tool-result":
+                result = block.get("result", "")
+                if not isinstance(result, str):
+                    result = json.dumps(result, ensure_ascii=False, sort_keys=True)
+                tool = lookup.get(call_id)
+                if tool is None:
+                    tool = ToolInteraction(
+                        tool_name=str(block.get("toolName", "cursor_tool")),
+                        input_summary="",
+                        call_id=call_id,
+                    )
+                    lookup[call_id] = tool
+                tool.output = truncate_block(result, max_tool_lines)
+    return lookup, batches
+
+
+def parse_cursor_session(path: str, opts) -> Conversation:
+    """Parse a Cursor Agent SQLite/protobuf chat into a Conversation."""
+    store_path = Path(path)
+    conv = Conversation()
+    conv.meta.source = "cursor"
+    conv.meta.session_id = store_path.parent.name
+
+    meta_path = store_path.parent / "meta.json"
+    try:
+        chat_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        conv.meta.cwd = chat_meta.get("cwd", "")
+    except (OSError, json.JSONDecodeError):
+        chat_meta = {}
+
+    database_uri = store_path.resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(database_uri, uri=True)
+    try:
+        row = connection.execute("SELECT value FROM meta WHERE key = '0'").fetchone()
+        if not row:
+            raise ValueError("Cursor store is missing root metadata")
+        try:
+            store_meta = json.loads(bytes.fromhex(row[0]).decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ValueError("Cursor store has malformed root metadata") from e
+        root_id = store_meta.get("latestRootBlobId", "")
+        if not isinstance(root_id, str) or len(root_id) != 64:
+            raise ValueError("Cursor store is missing latestRootBlobId")
+
+        def load_blob(blob_id: str) -> bytes:
+            blob_row = connection.execute(
+                "SELECT data FROM blobs WHERE id = ?", (blob_id,),
+            ).fetchone()
+            if not blob_row:
+                raise KeyError(blob_id)
+            return bytes(blob_row[0])
+
+        root = load_blob(root_id)
+        tools_by_id, prompt_tool_batches = _cursor_tool_lookup(
+            root, load_blob, opts.max_tool_lines,
+        )
+
+        for turn_index, turn_reference in enumerate(_pb_byte_values(root, 8)):
+            if len(turn_reference) != 32:
+                continue
+            try:
+                turn_structure = load_blob(turn_reference.hex())
+                agent_structure = _pb_first_bytes(turn_structure, 1)
+                if agent_structure is None:
+                    continue
+
+                user_reference = _pb_first_bytes(agent_structure, 1)
+                if user_reference is not None and len(user_reference) == 32:
+                    user_message = load_blob(user_reference.hex())
+                    user_text = _pb_first_bytes(user_message, 1)
+                    if user_text:
+                        conv.turns.append(Turn(
+                            role="user",
+                            content=user_text.decode("utf-8", errors="replace"),
+                        ))
+
+                text_parts = []
+                thinking_parts = []
+                tools = []
+                for step_reference in _pb_byte_values(agent_structure, 2):
+                    if len(step_reference) != 32:
+                        continue
+                    step = load_blob(step_reference.hex())
+                    assistant_message = _pb_first_bytes(step, 1)
+                    if assistant_message is not None:
+                        text = _pb_first_bytes(assistant_message, 1)
+                        if text:
+                            text_parts.append(text.decode("utf-8", errors="replace"))
+                        continue
+                    tool_call = _pb_first_bytes(step, 2)
+                    if tool_call is not None:
+                        raw_call_id = _pb_first_bytes(tool_call, 57)
+                        call_id = raw_call_id.decode("utf-8", errors="replace") if raw_call_id else ""
+                        existing = tools_by_id.get(call_id)
+                        if existing:
+                            tools.append(ToolInteraction(
+                                tool_name=existing.tool_name,
+                                input_summary=existing.input_summary,
+                                output=existing.output,
+                                call_id=existing.call_id,
+                            ))
+                        else:
+                            tools.append(ToolInteraction(
+                                tool_name="cursor_tool",
+                                input_summary="",
+                                call_id=call_id,
+                            ))
+                        continue
+                    if opts.include_thinking:
+                        thinking_message = _pb_first_bytes(step, 3)
+                        if thinking_message is not None:
+                            thinking = _pb_first_bytes(thinking_message, 1)
+                            if thinking:
+                                thinking_parts.append(
+                                    thinking.decode("utf-8", errors="replace")
+                                )
+
+                if not tools and turn_index < len(prompt_tool_batches):
+                    for call_id in prompt_tool_batches[turn_index]:
+                        existing = tools_by_id.get(call_id)
+                        if existing:
+                            tools.append(ToolInteraction(
+                                tool_name=existing.tool_name,
+                                input_summary=existing.input_summary,
+                                output=existing.output,
+                                call_id=existing.call_id,
+                            ))
+
+                if text_parts or thinking_parts or tools:
+                    conv.turns.append(Turn(
+                        role="assistant",
+                        content="\n\n".join(text_parts),
+                        thinking="\n\n".join(thinking_parts),
+                        tools=tools,
+                    ))
+            except (KeyError, ValueError) as e:
+                print(
+                    f"warn: skipping malformed Cursor turn {turn_reference.hex()[:12]}: {e}",
+                    file=sys.stderr,
+                )
+    finally:
+        connection.close()
+
+    return conv
+
+
 # ─── Markdown Renderer ────────────────────────────────────────────────────────
 
 
@@ -773,12 +1129,14 @@ def render_markdown(conv: Conversation, opts) -> str:
 
 
 def cmd_list(args):
-    """List available sessions from both tools."""
+    """List available sessions from supported harnesses."""
     sessions = []
-    if args.source in ("claude", "both"):
+    if args.source in ("claude", "both", "all"):
         sessions.extend(discover_claude_sessions(limit=args.limit))
-    if args.source in ("codex", "both"):
+    if args.source in ("codex", "both", "all"):
         sessions.extend(discover_codex_sessions(limit=args.limit))
+    if args.source in ("cursor", "all"):
+        sessions.extend(discover_cursor_sessions(limit=args.limit))
 
     sessions.sort(key=lambda s: s.get("timestamp", 0), reverse=True)
     sessions = sessions[: args.limit]
@@ -812,8 +1170,10 @@ def cmd_export(args):
 
     if source == "claude":
         conv = parse_claude_session(path, args)
-    else:
+    elif source == "codex":
         conv = parse_codex_session(path, args)
+    else:
+        conv = parse_cursor_session(path, args)
 
     # Apply --tail
     if args.tail and args.tail > 0:
@@ -949,8 +1309,12 @@ def _to_claude_tool_use(tool: ToolInteraction) -> dict:
 
 def _find_target_session(target_tool: str, target_id: str) -> Optional[dict]:
     """Find a target session by ID prefix in the given tool."""
-    pool = (discover_claude_sessions(limit=100) if target_tool == "claude"
-            else discover_codex_sessions(limit=100))
+    if target_tool == "claude":
+        pool = discover_claude_sessions(limit=100)
+    elif target_tool == "codex":
+        pool = discover_codex_sessions(limit=100)
+    else:
+        pool = discover_cursor_sessions(limit=100)
     matches = [s for s in pool if s["session_id"].startswith(target_id)]
     if not matches:
         return None
@@ -1093,7 +1457,7 @@ def write_as_claude_session(conv: Conversation, append_to: Optional[dict] = None
     if not append_to:
         first_user = next((t for t in conv.turns if t.role == "user"), None)
         display_text = first_user.content[:80] if first_user else "imported session"
-        display = f"[Imported from {conv.meta.source}] {display_text}"
+        display = f"[Imported] {display_text}"
         history_entry = {
             "display": display,
             "timestamp": int(datetime.now().timestamp() * 1000),
@@ -1137,10 +1501,9 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
             "timestamp": now_iso,
             "payload": {
                 "id": session_id, "timestamp": now_iso, "cwd": cwd,
-                "originator": "convo_porter", "cli_version": "0.0.0",
+                "originator": "convo_porter",
                 "source": "import",
-                "git": {"commit_hash": "", "branch": git_branch},
-                "base_instructions": {"text": "You are a coding agent. Continue the imported conversation."},
+                "git": {"branch": git_branch},
             },
         })
         records.append({
@@ -1209,6 +1572,220 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
     return session_id, str(jsonl_path)
 
 
+def _cursor_put_blob(blobs: dict[str, bytes], data: bytes) -> str:
+    blob_id = hashlib.sha256(data).hexdigest()
+    blobs[blob_id] = data
+    return blob_id
+
+
+def _cursor_tool_text(tools: list[ToolInteraction], max_tool_lines: int) -> str:
+    sections = []
+    for tool in tools:
+        lines = [f"Tool: {tool.tool_name}"]
+        if tool.input_summary:
+            lines.append(f"Input: {tool.input_summary}")
+        if tool.output:
+            lines.extend([
+                "Output:",
+                "```",
+                _sanitize_output(tool.output, max_tool_lines),
+                "```",
+            ])
+        sections.append("\n".join(lines))
+    if not sections:
+        return ""
+    return "Imported tool activity:\n\n" + "\n\n".join(sections)
+
+
+def write_as_cursor_session(conv: Conversation, append_to: Optional[dict] = None,
+                            max_tool_lines: int = 50) -> tuple:
+    """Write a new Cursor Agent chat using its minimal SQLite/protobuf graph."""
+    import uuid as uuid_mod
+
+    if append_to:
+        raise ValueError("appending to Cursor chats is not supported")
+
+    session_id = str(uuid_mod.uuid4())
+    cwd = os.path.abspath(os.path.expanduser(conv.meta.cwd or os.getcwd()))
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    blobs: dict[str, bytes] = {}
+    prompt_references: list[str] = []
+    turn_references: list[str] = []
+
+    grouped_turns = []
+    current_group = None
+    for turn in conv.turns:
+        if turn.role == "compaction":
+            continue
+        if turn.role == "user":
+            if current_group is not None:
+                grouped_turns.append(current_group)
+            current_group = {"user": turn, "assistants": []}
+        elif turn.role == "assistant":
+            if current_group is None:
+                current_group = {
+                    "user": Turn(role="user", content="Imported conversation"),
+                    "assistants": [],
+                }
+            current_group["assistants"].append(turn)
+    if current_group is not None:
+        grouped_turns.append(current_group)
+
+    for group in grouped_turns:
+        user_turn = group["user"]
+        message_id = str(uuid_mod.uuid4())
+        user_blob = (
+            _pb_string(1, user_turn.content)
+            + _pb_string(2, message_id)
+            + _pb_string(17, message_id)
+        )
+        user_blob_id = _cursor_put_blob(blobs, user_blob)
+
+        prompt_user = json.dumps(
+            {"role": "user", "content": user_turn.content},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        prompt_references.append(_cursor_put_blob(blobs, prompt_user))
+
+        step_references = []
+        for assistant_turn in group["assistants"]:
+            if assistant_turn.thinking:
+                thinking_message = (
+                    _pb_string(1, assistant_turn.thinking)
+                    + _pb_varint(2, 0)
+                )
+                thinking_step = _pb_bytes(3, thinking_message)
+                step_references.append(_cursor_put_blob(blobs, thinking_step))
+
+            if assistant_turn.content:
+                assistant_step = _pb_bytes(
+                    1, _pb_string(1, assistant_turn.content),
+                )
+                step_references.append(_cursor_put_blob(blobs, assistant_step))
+
+            prompt_content = []
+            if assistant_turn.thinking:
+                prompt_content.append({
+                    "type": "reasoning",
+                    "text": assistant_turn.thinking,
+                })
+            if assistant_turn.content:
+                prompt_content.append({
+                    "type": "text",
+                    "text": assistant_turn.content,
+                })
+
+            tool_results = []
+            for tool in assistant_turn.tools:
+                call_id = tool.call_id or f"call_imported_{uuid_mod.uuid4().hex[:16]}"
+                prompt_content.append({
+                    "type": "tool-call",
+                    "toolCallId": call_id,
+                    "toolName": tool.tool_name,
+                    "args": {"summary": tool.input_summary},
+                })
+                tool_results.append({
+                    "type": "tool-result",
+                    "toolCallId": call_id,
+                    "toolName": tool.tool_name,
+                    "result": _sanitize_output(tool.output or "", max_tool_lines),
+                })
+
+            if prompt_content:
+                prompt_assistant = json.dumps(
+                    {"role": "assistant", "content": prompt_content},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                prompt_references.append(_cursor_put_blob(blobs, prompt_assistant))
+            if tool_results:
+                prompt_tool = json.dumps(
+                    {"role": "tool", "content": tool_results},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                prompt_references.append(_cursor_put_blob(blobs, prompt_tool))
+                tool_text = _cursor_tool_text(assistant_turn.tools, max_tool_lines)
+                tool_summary_step = _pb_bytes(1, _pb_string(1, tool_text))
+                step_references.append(_cursor_put_blob(blobs, tool_summary_step))
+
+        agent_structure = _pb_bytes(1, bytes.fromhex(user_blob_id))
+        for step_id in step_references:
+            agent_structure += _pb_bytes(2, bytes.fromhex(step_id))
+        agent_structure += _pb_string(3, str(uuid_mod.uuid4()))
+        turn_structure = _pb_bytes(1, agent_structure)
+        turn_references.append(_cursor_put_blob(blobs, turn_structure))
+
+    root_structure = b""
+    for prompt_id in prompt_references:
+        root_structure += _pb_bytes(1, bytes.fromhex(prompt_id))
+    for turn_id in turn_references:
+        root_structure += _pb_bytes(8, bytes.fromhex(turn_id))
+    root_id = _cursor_put_blob(blobs, root_structure)
+
+    first_user = next((turn for turn in conv.turns if turn.role == "user"), None)
+    title = "Imported conversation"
+    if first_user and first_user.content.strip():
+        title = " ".join(first_user.content.split())[:80]
+
+    bucket = _cursor_workspace_path(cwd)
+    bucket.mkdir(parents=True, exist_ok=True)
+    final_dir = bucket / session_id
+    temporary_dir = Path(tempfile.mkdtemp(
+        prefix=f".convo-porter-{session_id}.", dir=str(bucket.parent),
+    ))
+    try:
+        store_path = temporary_dir / "store.db"
+        connection = sqlite3.connect(store_path)
+        try:
+            connection.executescript(
+                "PRAGMA user_version = 1;"
+                "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);"
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);"
+            )
+            connection.executemany(
+                "INSERT INTO blobs (id, data) VALUES (?, ?)",
+                sorted(blobs.items()),
+            )
+            store_metadata = {
+                "agentId": session_id,
+                "latestRootBlobId": root_id,
+                "name": title,
+                "createdAt": now_ms,
+                "blobEncryptionKey": secrets.token_hex(32),
+            }
+            encoded_metadata = json.dumps(
+                store_metadata, separators=(",", ":"),
+            ).encode("utf-8").hex()
+            connection.execute(
+                "INSERT INTO meta (key, value) VALUES ('0', ?)",
+                (encoded_metadata,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        chat_metadata = {
+            "schemaVersion": 1,
+            "createdAtMs": now_ms,
+            "updatedAtMs": now_ms,
+            "hasConversation": True,
+            "title": title,
+            "cwd": cwd,
+        }
+        (temporary_dir / "meta.json").write_text(
+            json.dumps(chat_metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_dir, final_dir)
+    except Exception:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+        raise
+
+    return session_id, str(final_dir / "store.db")
+
+
 # ─── Inject Command ──────────────────────────────────────────────────────────
 
 
@@ -1225,8 +1802,10 @@ def cmd_inject(args):
     # Parse source
     if session["source"] == "claude":
         conv = parse_claude_session(session["path"], args)
-    else:
+    elif session["source"] == "codex":
         conv = parse_codex_session(session["path"], args)
+    else:
+        conv = parse_cursor_session(session["path"], args)
 
     if args.tail and args.tail > 0:
         conv.turns = conv.turns[-args.tail:]
@@ -1239,6 +1818,12 @@ def cmd_inject(args):
     # Resolve --into target session
     append_to = None
     if args.into:
+        if args.target == "cursor":
+            print(
+                "Cursor target append is not supported; omit --into to create a new chat.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         append_to = _find_target_session(args.target, args.into)
         if not append_to:
             print(f"Target session '{args.into}' not found in {args.target}.", file=sys.stderr)
@@ -1252,12 +1837,17 @@ def cmd_inject(args):
         sid, path = write_as_claude_session(conv, append_to=append_to, max_tool_lines=mtl)
         print(f"{verb} {len(exportable)} turns to Claude Code session {sid[:8]}")
         print(f"  File: {path}")
-        print(f"  Open: claude --resume {sid} --dangerously-skip-permissions")
+        print(f"  Open: claude --resume {sid}")
     elif args.target == "codex":
         sid, path = write_as_codex_session(conv, append_to=append_to, max_tool_lines=mtl)
         print(f"{verb} {len(exportable)} turns to Codex session {sid[:8]}")
         print(f"  File: {path}")
         print(f"  Open: codex resume {sid}")
+    elif args.target == "cursor":
+        sid, path = write_as_cursor_session(conv, max_tool_lines=mtl)
+        print(f"Injected {len(exportable)} turns to Cursor Agent chat {sid[:8]}")
+        print(f"  File: {path}")
+        print(f"  Open: cursor-agent --resume {sid}")
 
 
 # ─── Install Command ──────────────────────────────────────────────────────────
@@ -1309,19 +1899,58 @@ def _target_specs(target: str = "all", install_root: str | None = None) -> dict[
     bundle = _bundle_dir()
     home = _home_for_install(install_root)
     claude_dir = home / ".claude" if install_root else CLAUDE_DIR
-    codex_dir = home / ".codex" if install_root else CODEX_DIR
+    agents_dir = home / ".agents"
+    shared_agent_specs = []
+    for skill_name in ("export-to-claude", "export-to-codex", "export-to-cursor"):
+        source_dir = bundle / "agents" / "skills" / skill_name
+        destination_dir = agents_dir / "skills" / skill_name
+        shared_agent_specs.extend([
+            (source_dir / "SKILL.md", destination_dir / "SKILL.md", True),
+            (source_dir / "agents" / "openai.yaml", destination_dir / "agents" / "openai.yaml", False),
+        ])
     specs = {
         "claude": [
             (bundle / "claude" / "commands" / "export-to-codex.md", claude_dir / "commands" / "export-to-codex.md", True),
+            (bundle / "claude" / "commands" / "export-to-cursor.md", claude_dir / "commands" / "export-to-cursor.md", True),
         ],
-        "codex": [
-            (bundle / "codex" / "skills" / "export-to-claude" / "SKILL.md", codex_dir / "skills" / "export-to-claude" / "SKILL.md", True),
-            (bundle / "codex" / "skills" / "export-to-claude" / "agents" / "openai.yaml", codex_dir / "skills" / "export-to-claude" / "agents" / "openai.yaml", False),
-        ],
+        "codex": shared_agent_specs,
     }
     if target == "all":
         return specs
+    if target == "cursor":
+        return {"cursor": shared_agent_specs}
     return {target: specs[target]}
+
+
+def _cleanup_legacy_codex_skill() -> list[str]:
+    """Remove the old managed Codex-only skill when it is recognisably ours."""
+    legacy_dir = CODEX_DIR / "skills" / "export-to-claude"
+    skill_path = legacy_dir / "SKILL.md"
+    try:
+        skill_text = skill_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    managed_markers = (
+        "name: export-to-claude",
+        "# Export to Claude",
+        "Inject the current Codex session into Claude Code's native session format.",
+        "inject --current --source codex --target claude",
+        "show the `claude --resume <id>` command",
+    )
+    if not all(marker in skill_text for marker in managed_markers):
+        return []
+
+    removed = []
+    for path in (legacy_dir / "agents" / "openai.yaml", skill_path):
+        if path.exists():
+            path.unlink()
+            removed.append(str(path))
+    for directory in (legacy_dir / "agents", legacy_dir):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 def delegated_install_result(
@@ -1360,11 +1989,22 @@ def delegated_install_result(
                 rec["sha256"] = _sha256(dst)
             files.append(rec)
         result["targets"][target_name] = {"files": files}
+    if (
+        operation == "install"
+        and perform
+        and not install_root
+        and target in ("all", "codex", "cursor")
+    ):
+        removed = _cleanup_legacy_codex_skill()
+        if removed:
+            result["warnings"].append(
+                "Removed legacy Codex-only skill files: " + ", ".join(removed)
+            )
     return result
 
 
 def cmd_install(args):
-    """Install slash-command and skill templates for Claude Code and Codex CLI."""
+    """Install Claude commands and shared Open Agent skills."""
     operation = "install"
     if getattr(args, "plan", False):
         operation = "plan"
@@ -1388,9 +2028,10 @@ def cmd_install(args):
         print()
         print("Done. Available commands:")
         if target in ("all", "claude"):
-            print("  Claude Code:  /export-to-codex")
-        if target in ("all", "codex"):
-            print("  Codex CLI:    $export-to-claude")
+            print("  Claude Code:  /export-to-codex, /export-to-cursor")
+        if target in ("all", "codex", "cursor"):
+            print("  Codex CLI:    $export-to-claude, $export-to-cursor")
+            print("  Cursor Agent: /export-to-claude, /export-to-codex")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1399,13 +2040,13 @@ def cmd_install(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="convo-porter",
-        description="Export conversations between Claude Code and Codex CLI",
+        description="Export conversations among Claude Code, Codex CLI, and Cursor Agent",
     )
     sub = parser.add_subparsers(dest="command")
 
     # install
     ip_install = sub.add_parser("install", help="Install slash-command and skill templates")
-    ip_install.add_argument("--target", choices=["claude", "codex", "tools", "all"], default="all")
+    ip_install.add_argument("--target", choices=["claude", "codex", "cursor", "tools", "all"], default="all")
     op = ip_install.add_mutually_exclusive_group()
     op.add_argument("--plan", action="store_true", help="Print intended files without writing")
     op.add_argument("--install", action="store_true", help="Install skill files (default)")
@@ -1415,13 +2056,13 @@ def main():
 
     # list
     lp = sub.add_parser("list", help="List available sessions")
-    lp.add_argument("--source", choices=["claude", "codex", "both"], default="both")
+    lp.add_argument("--source", choices=["claude", "codex", "cursor", "both", "all"], default="all")
     lp.add_argument("--limit", type=int, default=20)
 
     # export
     ep = sub.add_parser("export", help="Export a session to markdown")
     ep.add_argument("session_id", nargs="?", default=None)
-    ep.add_argument("--source", choices=["claude", "codex"], default=None)
+    ep.add_argument("--source", choices=["claude", "codex", "cursor"], default=None)
     ep.add_argument("--current", action="store_true")
     ep.add_argument("--output", "-o", default=None)
     ep.add_argument("--max-tool-lines", type=int, default=50)
@@ -1431,8 +2072,8 @@ def main():
     # inject
     ip = sub.add_parser("inject", help="Inject a session into another tool's native format")
     ip.add_argument("session_id", nargs="?", default=None)
-    ip.add_argument("--source", choices=["claude", "codex"], required=True)
-    ip.add_argument("--target", choices=["claude", "codex"], required=True)
+    ip.add_argument("--source", choices=["claude", "codex", "cursor"], required=True)
+    ip.add_argument("--target", choices=["claude", "codex", "cursor"], required=True)
     ip.add_argument("--into", default=None, help="Target session ID to append to (prefix match)")
     ip.add_argument("--current", action="store_true")
     ip.add_argument("--max-tool-lines", type=int, default=50)

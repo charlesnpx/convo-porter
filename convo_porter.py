@@ -22,6 +22,33 @@ CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
 CURSOR_DIR = Path.home() / ".cursor"
 EXPORTS_DIR = CLAUDE_DIR / "exports"
+_CODEX_CLI_VERSION: Optional[str] = None
+
+
+def _codex_cli_version() -> str:
+    """Return the installed Codex CLI version, caching failures as an empty string."""
+    global _CODEX_CLI_VERSION
+    if _CODEX_CLI_VERSION is not None:
+        return _CODEX_CLI_VERSION
+
+    try:
+        result = subprocess.run(
+            ["codex", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        _CODEX_CLI_VERSION = ""
+        return _CODEX_CLI_VERSION
+
+    if result.returncode != 0 or not result.stdout.strip():
+        _CODEX_CLI_VERSION = ""
+        return _CODEX_CLI_VERSION
+
+    first_line = result.stdout.splitlines()[0].split()
+    _CODEX_CLI_VERSION = first_line[-1] if first_line else ""
+    return _CODEX_CLI_VERSION
 
 
 # ─── Dataclasses ──────────────────────────────────────────────────────────────
@@ -1500,16 +1527,25 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
             "type": "session_meta",
             "timestamp": now_iso,
             "payload": {
-                "id": session_id, "timestamp": now_iso, "cwd": cwd,
+                "id": session_id, "session_id": session_id,
+                "timestamp": now_iso, "cwd": cwd,
                 "originator": "convo_porter",
-                "source": "import",
+                "cli_version": _codex_cli_version() or "0.0.0",
+                "source": "cli",
                 "git": {"branch": git_branch},
             },
         })
         records.append({
             "type": "turn_context",
             "timestamp": now_iso,
-            "payload": {"turn_id": str(uuid_mod.uuid4()), "cwd": cwd},
+            "payload": {
+                "turn_id": str(uuid_mod.uuid4()),
+                "cwd": cwd,
+                "approval_policy": "never",
+                "sandbox_policy": {"type": "danger-full-access"},
+                "model": "gpt-5.1-codex",
+                "summary": "auto",
+            },
         })
 
     for turn in conv.turns:

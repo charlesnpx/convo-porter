@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from datetime import datetime, timezone
@@ -41,6 +42,18 @@ def _codex_cli_version() -> str:
 
     first_line = result.stdout.splitlines()[0].split()
     return first_line[-1] if first_line else ""
+
+
+def _codex_state_db() -> Optional[Path]:
+    """Newest state_N.sqlite under CODEX_DIR, or None on old Codex versions."""
+    state_dbs = []
+    for path in CODEX_DIR.glob("state_*.sqlite"):
+        try:
+            number = int(path.stem[len("state_"):])
+        except ValueError:
+            continue
+        state_dbs.append((number, path))
+    return max(state_dbs, default=(None, None), key=lambda item: item[0])[1]
 
 
 # ─── Dataclasses ──────────────────────────────────────────────────────────────
@@ -76,6 +89,62 @@ class ConversationMeta:
 class Conversation:
     meta: ConversationMeta = field(default_factory=ConversationMeta)
     turns: list[Turn] = field(default_factory=list)
+
+
+def _register_codex_thread(session_id, jsonl_path, conv) -> None:
+    """Register an imported rollout with Codex's SQLite thread index."""
+    db_path = _codex_state_db()
+    if db_path is None:
+        return
+
+    now = int(time.time())
+    first_user = next(
+        (turn.content for turn in conv.turns if turn.role == "user"), "",
+    )
+    labels = {"claude-code": "Claude Code", "codex": "Codex", "cursor": "Cursor"}
+    known = labels.get(conv.meta.source)
+    suffix = f" (imported from {known})" if known else " (imported)"
+    title = (first_user[:140] + suffix).strip()
+    cwd = conv.meta.cwd or str(Path.home())
+    connection = None
+    try:
+        connection = sqlite3.connect(db_path, timeout=5.0)
+        connection.execute(
+            """
+            INSERT INTO threads (
+              id, rollout_path, created_at, updated_at, source, model_provider,
+              cwd, title, sandbox_policy, approval_mode, tokens_used,
+              has_user_event, archived, cli_version, first_user_message,
+              memory_mode, thread_source, created_at_ms, updated_at_ms,
+              preview, recency_at, recency_at_ms, history_mode
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+              rollout_path=excluded.rollout_path,
+              updated_at=excluded.updated_at,
+              updated_at_ms=excluded.updated_at_ms,
+              recency_at=excluded.recency_at,
+              recency_at_ms=excluded.recency_at_ms,
+              source=COALESCE(NULLIF(threads.source, ''), excluded.source),
+              cwd=COALESCE(NULLIF(threads.cwd, ''), excluded.cwd),
+              title=COALESCE(NULLIF(threads.title, ''), excluded.title),
+              first_user_message=COALESCE(NULLIF(threads.first_user_message, ''), excluded.first_user_message),
+              preview=COALESCE(NULLIF(threads.preview, ''), excluded.preview),
+              history_mode='legacy'
+            """,
+            (
+                session_id, str(jsonl_path), now, now, "cli", "openai_http",
+                cwd, title, '{"type":"disabled"}', "never", 0,
+                1, 0, "", first_user,
+                "enabled", "user", now * 1000, now * 1000,
+                title, now, now * 1000, "legacy",
+            ),
+        )
+        connection.commit()
+    except sqlite3.DatabaseError as error:
+        print(f"warn: could not register Codex thread in SQLite: {error}", file=sys.stderr)
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 # ─── Session Discovery ────────────────────────────────────────────────────────
@@ -1596,6 +1665,8 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
                 f.write(json.dumps(rec) + "\n")
     else:
         _atomic_write_jsonl(jsonl_path, records)
+
+    _register_codex_thread(session_id, jsonl_path, conv)
 
     return session_id, str(jsonl_path)
 

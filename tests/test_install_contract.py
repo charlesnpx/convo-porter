@@ -102,6 +102,7 @@ def _read_jsonl(path):
 
 def test_codex_export_omits_source_provider_and_model_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path / "codex")
+    monkeypatch.setattr(convo_porter, "_codex_cli_version", lambda: "0.151.0")
     source_model = "claude-3-5-sonnet-20241022"
     conv = Conversation(
         meta=ConversationMeta(
@@ -123,11 +124,43 @@ def test_codex_export_omits_source_provider_and_model_metadata(tmp_path, monkeyp
     turn_context = next(record for record in records if record["type"] == "turn_context")
 
     assert "model_provider" not in session_meta["payload"]
-    assert "model" not in turn_context["payload"]
     assert "base_instructions" not in session_meta["payload"]
-    assert "cli_version" not in session_meta["payload"]
     assert "anthropic" not in serialized
     assert source_model not in serialized
+
+
+def test_codex_rollout_headers_include_required_parseability_fields(tmp_path, monkeypatch):
+    cwd = str(tmp_path / "project")
+    monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path / "codex")
+    monkeypatch.setattr(convo_porter, "_codex_cli_version", lambda: "0.151.0")
+    conv = Conversation(
+        meta=ConversationMeta(cwd=cwd, git_branch="main"),
+        turns=[Turn(role="user", content="hello")],
+    )
+
+    session_id, jsonl_path = convo_porter.write_as_codex_session(conv)
+    records = _read_jsonl(jsonl_path)
+    session_meta = records[0]
+    turn_context = records[1]
+
+    assert session_meta["type"] == "session_meta"
+    meta_payload = session_meta["payload"]
+    assert meta_payload["id"] == session_id
+    assert meta_payload["session_id"] == session_id
+    assert meta_payload["timestamp"]
+    assert meta_payload["cwd"] == cwd
+    assert meta_payload["originator"] == "convo_porter"
+    assert meta_payload["cli_version"]
+    assert meta_payload["source"] == "cli"
+
+    assert turn_context["type"] == "turn_context"
+    context_payload = turn_context["payload"]
+    assert isinstance(context_payload["turn_id"], str) and context_payload["turn_id"]
+    assert context_payload["cwd"] == cwd
+    assert context_payload["approval_policy"] == "never"
+    assert context_payload["sandbox_policy"] == {"type": "danger-full-access"}
+    assert context_payload["model"] == "gpt-5.1-codex"
+    assert context_payload["summary"] == "auto"
 
 
 def _cursor_opts(include_thinking=True, max_tool_lines=50):

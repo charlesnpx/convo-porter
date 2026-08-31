@@ -101,9 +101,11 @@ def _register_codex_thread(session_id, jsonl_path, conv) -> None:
     first_user = next(
         (turn.content for turn in conv.turns if turn.role == "user"), "",
     )
-    title = (first_user[:140] + " (imported from Claude Code)").strip()
+    labels = {"claude-code": "Claude Code", "codex": "Codex", "cursor": "Cursor"}
+    known = labels.get(conv.meta.source)
+    suffix = f" (imported from {known})" if known else " (imported)"
+    title = (first_user[:140] + suffix).strip()
     cwd = conv.meta.cwd or str(Path.home())
-    cli_version = _codex_cli_version() or ""
     connection = None
     try:
         connection = sqlite3.connect(db_path, timeout=5.0)
@@ -122,29 +124,24 @@ def _register_codex_thread(session_id, jsonl_path, conv) -> None:
               updated_at_ms=excluded.updated_at_ms,
               recency_at=excluded.recency_at,
               recency_at_ms=excluded.recency_at_ms,
-              source=CASE WHEN threads.cwd='' THEN excluded.source ELSE threads.source END,
-              cwd=CASE WHEN threads.cwd='' THEN excluded.cwd ELSE threads.cwd END,
-              title=CASE WHEN threads.title='' THEN excluded.title ELSE threads.title END,
-              first_user_message=CASE WHEN threads.first_user_message=''
-                THEN excluded.first_user_message ELSE threads.first_user_message END,
-              preview=CASE WHEN threads.preview='' THEN excluded.preview ELSE threads.preview END,
+              source=COALESCE(NULLIF(threads.source, ''), excluded.source),
+              cwd=COALESCE(NULLIF(threads.cwd, ''), excluded.cwd),
+              title=COALESCE(NULLIF(threads.title, ''), excluded.title),
+              first_user_message=COALESCE(NULLIF(threads.first_user_message, ''), excluded.first_user_message),
+              preview=COALESCE(NULLIF(threads.preview, ''), excluded.preview),
               history_mode='legacy'
             """,
             (
                 session_id, str(jsonl_path), now, now, "cli", "openai_http",
                 cwd, title, '{"type":"disabled"}', "never", 0,
-                1, 0, cli_version, first_user,
+                1, 0, "", first_user,
                 "enabled", "user", now * 1000, now * 1000,
                 title, now, now * 1000, "legacy",
             ),
         )
         connection.commit()
-    except sqlite3.OperationalError as error:
-        print(
-            "warn: could not register Codex thread in SQLite "
-            f"(schema may differ; session remains resumable by filesystem scan): {error}",
-            file=sys.stderr,
-        )
+    except sqlite3.DatabaseError as error:
+        print(f"warn: could not register Codex thread in SQLite: {error}", file=sys.stderr)
     finally:
         if connection is not None:
             connection.close()

@@ -151,12 +151,11 @@ def test_codex_rollout_headers_include_required_parseability_fields(tmp_path, mo
     assert meta_payload["cwd"] == cwd
     assert meta_payload["originator"] == "convo_porter"
     assert meta_payload["cli_version"]
-    assert meta_payload["source"] in {
-        "cli", "vscode", "exec", "mcp", "custom", "internal", "subagent",
-    }
+    assert meta_payload["source"] == "cli"
 
     assert turn_context["type"] == "turn_context"
     context_payload = turn_context["payload"]
+    assert isinstance(context_payload["turn_id"], str) and context_payload["turn_id"]
     assert context_payload["cwd"] == cwd
     assert context_payload["approval_policy"] == "never"
     assert context_payload["sandbox_policy"] == {"type": "danger-full-access"}

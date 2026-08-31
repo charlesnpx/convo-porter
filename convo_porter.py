@@ -22,15 +22,10 @@ CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
 CURSOR_DIR = Path.home() / ".cursor"
 EXPORTS_DIR = CLAUDE_DIR / "exports"
-_CODEX_CLI_VERSION: Optional[str] = None
 
 
 def _codex_cli_version() -> str:
-    """Return the installed Codex CLI version, caching failures as an empty string."""
-    global _CODEX_CLI_VERSION
-    if _CODEX_CLI_VERSION is not None:
-        return _CODEX_CLI_VERSION
-
+    """Return the installed Codex CLI version, or an empty string on failure."""
     try:
         result = subprocess.run(
             ["codex", "--version"],
@@ -39,16 +34,13 @@ def _codex_cli_version() -> str:
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError, UnicodeError):
-        _CODEX_CLI_VERSION = ""
-        return _CODEX_CLI_VERSION
+        return ""
 
     if result.returncode != 0 or not result.stdout.strip():
-        _CODEX_CLI_VERSION = ""
-        return _CODEX_CLI_VERSION
+        return ""
 
     first_line = result.stdout.splitlines()[0].split()
-    _CODEX_CLI_VERSION = first_line[-1] if first_line else ""
-    return _CODEX_CLI_VERSION
+    return first_line[-1] if first_line else ""
 
 
 # ─── Dataclasses ──────────────────────────────────────────────────────────────

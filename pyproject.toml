@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "convo-porter"
-version = "0.2.0"
+version = "0.3.0"
 description = "Transfer conversations among Claude Code, Codex CLI, and Cursor Agent"
 requires-python = ">=3.10"
 

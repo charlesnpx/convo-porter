@@ -56,6 +56,13 @@ def _codex_state_db() -> Optional[Path]:
     return max(state_dbs, default=(None, None), key=lambda item: item[0])[1]
 
 
+def _codex_call_id(raw: str) -> str:
+    """Return a call_id valid for the OpenAI Responses API (max 64 chars)."""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw):
+        return raw
+    return "call_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+
+
 # ─── Dataclasses ──────────────────────────────────────────────────────────────
 
 
@@ -1638,7 +1645,9 @@ def write_as_codex_session(conv: Conversation, append_to: Optional[dict] = None,
 
             # Emit each tool as a function_call + function_call_output pair
             for tool in turn.tools:
-                call_id = tool.call_id or f"call_imported_{uuid_mod.uuid4().hex[:12]}"
+                call_id = _codex_call_id(
+                    tool.call_id or f"call_imported_{uuid_mod.uuid4().hex[:12]}"
+                )
                 args = json.dumps({"command": tool.input_summary or tool.tool_name})
                 records.append({
                     "type": "response_item", "timestamp": ts,

@@ -1,7 +1,8 @@
+import json
 import sqlite3
 
 import convo_porter
-from convo_porter import Conversation, ConversationMeta, Turn
+from convo_porter import Conversation, ConversationMeta, ToolInteraction, Turn
 
 
 def test_register_codex_thread_upserts_and_skips_old_codex(tmp_path, monkeypatch):
@@ -124,3 +125,54 @@ def test_register_codex_thread_degrades_on_schema_drift(tmp_path, monkeypatch):
     assert convo_porter._register_codex_thread(
         "schema-drift-session", tmp_path / "sessions" / "rollout.jsonl", conv
     ) is None
+
+
+def test_codex_export_sanitizes_cursor_call_ids(tmp_path, monkeypatch):
+    monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path / "codex")
+    monkeypatch.setattr(convo_porter, "_codex_cli_version", lambda: "0.0.0")
+    composite_id = (
+        "call-a0aed434-d86d-4bbc-a629-b7a06d6aedf6-283\n"
+        "fc_182eff1b-ab8e-9fa6-ae85-0c93c77af666_0"
+    )
+    valid_id = "call_abc123"
+    conv = Conversation(
+        turns=[Turn(
+            role="assistant",
+            content="",
+            tools=[
+                ToolInteraction(
+                    tool_name="exec_command",
+                    input_summary="echo cursor",
+                    output="ok",
+                    call_id=composite_id,
+                ),
+                ToolInteraction(
+                    tool_name="exec_command",
+                    input_summary="echo valid",
+                    output="ok",
+                    call_id=valid_id,
+                ),
+            ],
+        )],
+    )
+
+    _, jsonl_path = convo_porter.write_as_codex_session(conv)
+    with open(jsonl_path, encoding="utf-8") as rollout:
+        records = [json.loads(line) for line in rollout]
+    function_calls = [
+        record["payload"]
+        for record in records
+        if record["payload"].get("type") == "function_call"
+    ]
+    function_outputs = [
+        record["payload"]
+        for record in records
+        if record["payload"].get("type") == "function_call_output"
+    ]
+
+    assert len(composite_id) == 87
+    expected_id = "call_2b5e490eb1714c7ba345fb71550587aee92304aa"
+    assert function_calls[0]["call_id"] == expected_id
+    assert function_outputs[0]["call_id"] == expected_id
+    assert function_calls[1]["call_id"] == valid_id
+    assert function_outputs[1]["call_id"] == valid_id

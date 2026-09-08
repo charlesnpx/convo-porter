@@ -63,6 +63,13 @@ def _codex_call_id(raw: str) -> str:
     return "call_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
+def _claude_tool_use_id(raw: str) -> str:
+    """Return a tool_use id valid for the Anthropic API (^[a-zA-Z0-9_-]+$)."""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw):
+        return raw
+    return "toolu_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+
+
 # ─── Dataclasses ──────────────────────────────────────────────────────────────
 
 
@@ -1383,7 +1390,7 @@ _CLAUDE_TOOL_MAP = {
 }
 
 
-def _to_claude_tool_use(tool: ToolInteraction) -> dict:
+def _to_claude_tool_use(tool: ToolInteraction, block_id: str) -> dict:
     """Build a Claude Code tool_use content block from a ToolInteraction."""
     name = _CLAUDE_TOOL_MAP.get(tool.tool_name, "Bash")
     if name == "Bash":
@@ -1399,7 +1406,7 @@ def _to_claude_tool_use(tool: ToolInteraction) -> dict:
         inp = {"prompt": tool.input_summary or "", "description": tool.input_summary or ""}
     else:
         inp = {"command": tool.input_summary or tool.tool_name}
-    return {"type": "tool_use", "id": tool.call_id, "name": name, "input": inp}
+    return {"type": "tool_use", "id": block_id, "name": name, "input": inp}
 
 
 def _find_target_session(target_tool: str, target_id: str) -> Optional[dict]:
@@ -1506,10 +1513,11 @@ def write_as_claude_session(conv: Conversation, append_to: Optional[dict] = None
 
             tool_pairs = []
             for tool in turn.tools:
-                if not tool.call_id:
-                    tool.call_id = f"toolu_imported_{uuid_mod.uuid4().hex[:12]}"
-                content.append(_to_claude_tool_use(tool))
-                tool_pairs.append((tool.call_id, tool))
+                claude_id = _claude_tool_use_id(
+                    tool.call_id or f"toolu_imported_{uuid_mod.uuid4().hex[:12]}"
+                )
+                content.append(_to_claude_tool_use(tool, claude_id))
+                tool_pairs.append((claude_id, tool))
 
             rec = _base(record_uuid, ts)
             rec["type"] = "assistant"

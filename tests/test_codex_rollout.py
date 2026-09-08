@@ -1,5 +1,4 @@
 import json
-import re
 import sqlite3
 
 import convo_porter
@@ -172,9 +171,8 @@ def test_codex_export_sanitizes_cursor_call_ids(tmp_path, monkeypatch):
     ]
 
     assert len(composite_id) == 87
-    sanitized_id = function_calls[0]["call_id"]
-    assert sanitized_id == function_outputs[0]["call_id"]
-    assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", sanitized_id)
-    assert sanitized_id != composite_id
+    expected_id = "call_2b5e490eb1714c7ba345fb71550587aee92304aa"
+    assert function_calls[0]["call_id"] == expected_id
+    assert function_outputs[0]["call_id"] == expected_id
     assert function_calls[1]["call_id"] == valid_id
     assert function_outputs[1]["call_id"] == valid_id

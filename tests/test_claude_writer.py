@@ -13,47 +13,32 @@ def test_claude_export_sanitizes_composite_tool_ids_and_preserves_canonical_ids(
         "fc_182eff1b-ab8e-9fa6-ae85-0c93c77af666_0"
     )
     valid_id = "toolu_abc123"
-    conv = Conversation(
-        turns=[Turn(
-            role="assistant",
-            content="",
-            tools=[
-                ToolInteraction(
-                    tool_name="exec_command",
-                    input_summary="echo composite",
-                    output="composite output",
-                    call_id=composite_id,
-                ),
-                ToolInteraction(
-                    tool_name="exec_command",
-                    input_summary="echo valid",
-                    output="valid output",
-                    call_id=valid_id,
-                ),
-            ],
-        )],
-    )
+    tools = [
+        ToolInteraction(
+            tool_name="exec_command", input_summary="echo", output="output", call_id=call_id,
+        )
+        for call_id in (composite_id, valid_id, "")
+    ]
+    conv = Conversation(turns=[Turn(role="assistant", content="", tools=tools)])
 
     _, jsonl_path = convo_porter.write_as_claude_session(conv)
     with open(jsonl_path, encoding="utf-8") as session:
         records = [json.loads(line) for line in session]
 
-    assistant = next(record for record in records if record["type"] == "assistant")
-    tool_use_blocks = [
-        block for block in assistant["message"]["content"]
+    assistant = next(r for r in records if r["type"] == "assistant")
+    tool_use_ids = [
+        block["id"] for block in assistant["message"]["content"]
         if block["type"] == "tool_use"
     ]
-    result_record = next(
-        record
-        for record in records
-        if record["type"] == "user"
-        and isinstance(record["message"]["content"], list)
+    result = next(
+        r for r in records
+        if r["type"] == "user" and isinstance(r["message"]["content"], list)
     )
-    tool_result_blocks = result_record["message"]["content"]
+    tool_result_ids = [block["tool_use_id"] for block in result["message"]["content"]]
 
     expected_id = "toolu_2b5e490eb1714c7ba345fb71550587aee92304aa"
-    assert [block["id"] for block in tool_use_blocks] == [expected_id, valid_id]
-    assert [block["tool_use_id"] for block in tool_result_blocks] == [
-        expected_id, valid_id,
-    ]
-    assert [tool.call_id for tool in conv.turns[0].tools] == [composite_id, valid_id]
+    assert tool_use_ids[:2] == [expected_id, valid_id]
+    assert tool_use_ids[2].startswith("toolu_imported_")
+    assert len(tool_use_ids[2]) == len("toolu_imported_") + 12
+    assert tool_result_ids == tool_use_ids
+    assert [tool.call_id for tool in conv.turns[0].tools] == [composite_id, valid_id, ""]

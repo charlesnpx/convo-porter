@@ -105,6 +105,46 @@ class Conversation:
     turns: list[Turn] = field(default_factory=list)
 
 
+def _codex_config_provider() -> Optional[str]:
+    """Return the top-level model_provider from Codex's config.toml, if set."""
+    try:
+        text = (CODEX_DIR / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            return None
+        match = re.fullmatch(r'model_provider\s*=\s*["\']([^"\']+)["\'](\s*#.*)?', stripped)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _codex_target_provider(db_path: Path) -> str:
+    """Pick the provider under which Codex's resume picker will list an import.
+
+    The picker shows only threads whose provider matches the active one, so prefer
+    the provider of the Codex thread running this export, then the configured default.
+    """
+    thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if thread_id:
+        connection = None
+        try:
+            connection = sqlite3.connect(db_path, timeout=5.0)
+            row = connection.execute(
+                "SELECT model_provider FROM threads WHERE id = ?", (thread_id,),
+            ).fetchone()
+            if row and row[0]:
+                return row[0]
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
+    return _codex_config_provider() or "openai"
+
+
 def _register_codex_thread(session_id, jsonl_path, conv) -> None:
     """Register an imported rollout with Codex's SQLite thread index."""
     db_path = _codex_state_db()
@@ -120,6 +160,7 @@ def _register_codex_thread(session_id, jsonl_path, conv) -> None:
     suffix = f" (imported from {known})" if known else " (imported)"
     title = (first_user[:140] + suffix).strip()
     cwd = conv.meta.cwd or str(Path.home())
+    provider = _codex_target_provider(db_path)
     connection = None
     try:
         connection = sqlite3.connect(db_path, timeout=5.0)
@@ -146,7 +187,7 @@ def _register_codex_thread(session_id, jsonl_path, conv) -> None:
               history_mode='legacy'
             """,
             (
-                session_id, str(jsonl_path), now, now, "cli", "openai_http",
+                session_id, str(jsonl_path), now, now, "cli", provider,
                 cwd, title, '{"type":"disabled"}', "never", 0,
                 1, 0, "", first_user,
                 "enabled", "user", now * 1000, now * 1000,
@@ -235,35 +276,35 @@ def discover_codex_sessions(limit: int = 20) -> list:
         reverse=True,
     )
 
-    results = []
-    for f in files[:limit]:
-        meta = {}
-        try:
-            with open(f) as fh:
-                for fline in fh:
-                    fline = fline.strip()
-                    if not fline:
-                        continue
-                    rec = json.loads(fline)
-                    if rec.get("type") == "session_meta":
-                        meta = rec.get("payload", {})
-                        break
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"warn: could not read Codex session {f}: {e}", file=sys.stderr)
+    return [_codex_session_record(f) for f in files[:limit]]
 
-        sid = meta.get("id", f.stem)
-        cwd = meta.get("cwd", "")
-        git_info = meta.get("git", {})
-        results.append({
-            "session_id": sid,
-            "source": "codex",
-            "project": cwd,
-            "path": str(f),
-            "display": "",
-            "timestamp": int(f.stat().st_mtime * 1000),
-            "git_branch": git_info.get("branch", ""),
-        })
-    return results
+
+def _codex_session_record(f: Path) -> dict:
+    """Describe one Codex rollout file using its session_meta header."""
+    meta = {}
+    try:
+        with open(f) as fh:
+            for fline in fh:
+                fline = fline.strip()
+                if not fline:
+                    continue
+                rec = json.loads(fline)
+                if rec.get("type") == "session_meta":
+                    meta = rec.get("payload", {})
+                    break
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"warn: could not read Codex session {f}: {e}", file=sys.stderr)
+
+    git_info = meta.get("git", {})
+    return {
+        "session_id": meta.get("id", f.stem),
+        "source": "codex",
+        "project": meta.get("cwd", ""),
+        "path": str(f),
+        "display": "",
+        "timestamp": int(f.stat().st_mtime * 1000),
+        "git_branch": git_info.get("branch", ""),
+    }
 
 
 def _cursor_workspace_path(cwd: str) -> Path:
@@ -352,7 +393,17 @@ def find_current_claude_session() -> Optional[dict]:
 
 
 def find_current_codex_session() -> Optional[dict]:
-    """Find the most recent Codex session."""
+    """Find the Codex session named by CODEX_THREAD_ID, else the most recent one."""
+    thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    sessions_dir = CODEX_DIR / "sessions"
+    if thread_id and sessions_dir.exists():
+        matches = sorted(
+            sessions_dir.rglob(f"*{thread_id}.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if matches:
+            return _codex_session_record(matches[0])
     sessions = discover_codex_sessions(limit=1)
     return sessions[0] if sessions else None
 
@@ -372,6 +423,32 @@ def find_current_cursor_session() -> Optional[dict]:
 
 
 # ─── Unified Session Resolution ──────────────────────────────────────────────
+
+
+HARNESS_ENVIRONMENT = (
+    ("claude", "CLAUDECODE"),
+    ("codex", "CODEX_THREAD_ID"),
+    ("cursor", "CURSOR_AGENT_CHAT_ID"),
+)
+
+
+def detect_current_harness() -> str:
+    """Return the harness running this process, based on its session environment.
+
+    Raises SystemExit when no harness, or more than one, is detected.
+    """
+    detected = [
+        harness for harness, variable in HARNESS_ENVIRONMENT
+        if os.environ.get(variable, "").strip()
+    ]
+    if len(detected) == 1:
+        return detected[0]
+    if detected:
+        print(f"Detected several harnesses ({', '.join(detected)}); pass --source.",
+              file=sys.stderr)
+    else:
+        print("Could not detect the current harness; pass --source.", file=sys.stderr)
+    sys.exit(1)
 
 
 def resolve_session(session_id=None, current=False, source=None) -> dict:
@@ -1906,13 +1983,11 @@ def write_as_cursor_session(conv: Conversation, append_to: Optional[dict] = None
 
 
 def cmd_inject(args):
-    """Inject a session from one tool into another's native format."""
-    if args.source == args.target:
-        print(f"Error: source and target must differ (both are '{args.source}').",
-              file=sys.stderr)
-        sys.exit(1)
-
-    session = resolve_session(args.session_id, args.current, args.source)
+    """Inject a session into a harness's native format, including its own."""
+    source = args.source
+    if source is None and args.current:
+        source = detect_current_harness()
+    session = resolve_session(args.session_id, args.current, source)
     _print_resolved(session)
 
     # Parse source
@@ -1943,6 +2018,11 @@ def cmd_inject(args):
         append_to = _find_target_session(args.target, args.into)
         if not append_to:
             print(f"Target session '{args.into}' not found in {args.target}.", file=sys.stderr)
+            sys.exit(1)
+        if (append_to["source"] == session["source"]
+                and append_to["session_id"] == session["session_id"]):
+            print("Cannot append a session to itself; omit --into to create a new session.",
+                  file=sys.stderr)
             sys.exit(1)
 
     verb = "Appended" if append_to else "Injected"
@@ -2009,24 +2089,30 @@ def _home_for_install(install_root: str | None) -> Path:
     return Path(install_root).expanduser().resolve() if install_root else Path.home()
 
 
+SKILL_NAMES = ("export:to-claude", "export:to-codex", "export:to-cursor")
+LEGACY_SKILL_NAMES = ("export-to-claude", "export-to-codex", "export-to-cursor")
+LEGACY_CLAUDE_COMMANDS = ("export-to-codex.md", "export-to-cursor.md")
+
+
 def _target_specs(target: str = "all", install_root: str | None = None) -> dict[str, list[tuple[Path, Path, bool]]]:
     bundle = _bundle_dir()
     home = _home_for_install(install_root)
     claude_dir = home / ".claude" if install_root else CLAUDE_DIR
     agents_dir = home / ".agents"
     shared_agent_specs = []
-    for skill_name in ("export-to-claude", "export-to-codex", "export-to-cursor"):
+    claude_specs = []
+    for skill_name in SKILL_NAMES:
         source_dir = bundle / "agents" / "skills" / skill_name
         destination_dir = agents_dir / "skills" / skill_name
         shared_agent_specs.extend([
             (source_dir / "SKILL.md", destination_dir / "SKILL.md", True),
             (source_dir / "agents" / "openai.yaml", destination_dir / "agents" / "openai.yaml", False),
         ])
+        claude_specs.append(
+            (source_dir / "SKILL.md", claude_dir / "skills" / skill_name / "SKILL.md", True),
+        )
     specs = {
-        "claude": [
-            (bundle / "claude" / "commands" / "export-to-codex.md", claude_dir / "commands" / "export-to-codex.md", True),
-            (bundle / "claude" / "commands" / "export-to-cursor.md", claude_dir / "commands" / "export-to-cursor.md", True),
-        ],
+        "claude": claude_specs,
         "codex": shared_agent_specs,
     }
     if target == "all":
@@ -2064,6 +2150,45 @@ def _cleanup_legacy_codex_skill() -> list[str]:
             directory.rmdir()
         except OSError:
             pass
+    return removed
+
+
+def _is_managed_legacy_template(path: Path) -> bool:
+    """True when a pre-0.4 export-to-* file was written by convo-porter install."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "name: export-to-" in text and "inject --current --source" in text
+
+
+def _remove_empty_dirs(*directories: Path) -> None:
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def _cleanup_legacy_export_templates(home: Path, target: str) -> list[str]:
+    """Remove managed export-to-* skills and commands replaced by export:to-*."""
+    removed = []
+    if target in ("all", "codex", "cursor"):
+        for skill_name in LEGACY_SKILL_NAMES:
+            skill_dir = home / ".agents" / "skills" / skill_name
+            if not _is_managed_legacy_template(skill_dir / "SKILL.md"):
+                continue
+            for path in (skill_dir / "agents" / "openai.yaml", skill_dir / "SKILL.md"):
+                if path.exists():
+                    path.unlink()
+                    removed.append(str(path))
+            _remove_empty_dirs(skill_dir / "agents", skill_dir)
+    if target in ("all", "claude"):
+        for command in LEGACY_CLAUDE_COMMANDS:
+            path = home / ".claude" / "commands" / command
+            if _is_managed_legacy_template(path):
+                path.unlink()
+                removed.append(str(path))
     return removed
 
 
@@ -2114,11 +2239,17 @@ def delegated_install_result(
             result["warnings"].append(
                 "Removed legacy Codex-only skill files: " + ", ".join(removed)
             )
+    if operation == "install" and perform and target != "tools":
+        removed = _cleanup_legacy_export_templates(_home_for_install(install_root), target)
+        if removed:
+            result["warnings"].append(
+                "Removed export-to-* files replaced by export:to-*: " + ", ".join(removed)
+            )
     return result
 
 
 def cmd_install(args):
-    """Install Claude commands and shared Open Agent skills."""
+    """Install export skills for Claude Code and the shared Open Agent skills directory."""
     operation = "install"
     if getattr(args, "plan", False):
         operation = "plan"
@@ -2134,6 +2265,8 @@ def cmd_install(args):
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2))
         return
+    for warning in result["warnings"]:
+        print(f"warn: {warning}", file=sys.stderr)
     for target_name, info in result["targets"].items():
         print(f"{operation.title()} {target_name}:")
         for f in info["files"]:
@@ -2142,10 +2275,10 @@ def cmd_install(args):
         print()
         print("Done. Available commands:")
         if target in ("all", "claude"):
-            print("  Claude Code:  /export-to-codex, /export-to-cursor")
+            print("  Claude Code:  /export:to-claude, /export:to-codex, /export:to-cursor")
         if target in ("all", "codex", "cursor"):
-            print("  Codex CLI:    $export-to-claude, $export-to-cursor")
-            print("  Cursor Agent: /export-to-claude, /export-to-codex")
+            print("  Codex CLI:    $export:to-claude, $export:to-codex, $export:to-cursor")
+            print("  Cursor Agent: /export:to-claude, /export:to-codex, /export:to-cursor")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -2159,7 +2292,7 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # install
-    ip_install = sub.add_parser("install", help="Install slash-command and skill templates")
+    ip_install = sub.add_parser("install", help="Install export skill templates")
     ip_install.add_argument("--target", choices=["claude", "codex", "cursor", "tools", "all"], default="all")
     op = ip_install.add_mutually_exclusive_group()
     op.add_argument("--plan", action="store_true", help="Print intended files without writing")
@@ -2184,9 +2317,10 @@ def main():
     ep.add_argument("--tail", type=int, default=None)
 
     # inject
-    ip = sub.add_parser("inject", help="Inject a session into another tool's native format")
+    ip = sub.add_parser("inject", help="Inject a session into a harness's native format")
     ip.add_argument("session_id", nargs="?", default=None)
-    ip.add_argument("--source", choices=["claude", "codex", "cursor"], required=True)
+    ip.add_argument("--source", choices=["claude", "codex", "cursor"], default=None,
+                    help="Source harness (detected from the environment with --current)")
     ip.add_argument("--target", choices=["claude", "codex", "cursor"], required=True)
     ip.add_argument("--into", default=None, help="Target session ID to append to (prefix match)")
     ip.add_argument("--current", action="store_true")

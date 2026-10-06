@@ -32,10 +32,14 @@ def test_shared_agent_install_targets_use_open_agents_directory(tmp_path):
     cursor_paths = [entry["path"] for entry in cursor["targets"]["cursor"]["files"]]
     assert codex_paths == cursor_paths
     assert len(codex_paths) == 6
-    assert all("/.agents/skills/export-to-" in path for path in codex_paths)
+    assert all("/.agents/skills/export:to-" in path for path in codex_paths)
     assert all("/.codex/" not in path and "/.cursor/" not in path for path in codex_paths)
     assert set(all_targets["targets"]) == {"claude", "codex"}
-    assert len(all_targets["targets"]["claude"]["files"]) == 2
+    claude_paths = [entry["path"] for entry in all_targets["targets"]["claude"]["files"]]
+    assert sorted(claude_paths) == sorted(
+        str((stage / ".claude" / "skills" / name / "SKILL.md").resolve())
+        for name in ("export:to-claude", "export:to-codex", "export:to-cursor")
+    )
 
 
 def test_delegated_install_stages_all_templates(tmp_path):
@@ -49,11 +53,12 @@ def test_delegated_install_stages_all_templates(tmp_path):
         for target in result["targets"].values()
         for entry in target["files"]
     ]
-    assert len(files) == 8
+    assert len(files) == 9
     assert all(path.exists() for path in files)
     templates = [path.read_text() for path in files if path.name.endswith(".md")]
     assert all("__BINARY__" not in template for template in templates)
-    assert all("convo-porter inject" in template for template in templates)
+    assert all("convo-porter inject --current --target" in template for template in templates)
+    assert all("--source codex --target" not in template for template in templates)
     module_path = str(Path(convo_porter.__file__).resolve())
     assert all(module_path not in template for template in templates)
 
@@ -363,15 +368,12 @@ def test_cursor_target_append_is_rejected_before_target_lookup(monkeypatch):
 @pytest.mark.parametrize(
     ("source", "target"),
     [
-        ("claude", "codex"),
-        ("claude", "cursor"),
-        ("codex", "claude"),
-        ("codex", "cursor"),
-        ("cursor", "claude"),
-        ("cursor", "codex"),
+        (source, target)
+        for source in ("claude", "codex", "cursor")
+        for target in ("claude", "codex", "cursor")
     ],
 )
-def test_inject_dispatch_supports_all_six_directions(
+def test_inject_dispatch_supports_all_nine_directions(
     source, target, monkeypatch, capsys,
 ):
     args = SimpleNamespace(
@@ -455,3 +457,108 @@ def test_claude_export_uses_synthetic_model_for_imported_assistant_records(tmp_p
         for record in assistant_records
     )
     assert source_model not in serialized
+
+
+def test_delegated_install_removes_only_managed_legacy_export_templates(tmp_path):
+    stage = tmp_path / "stage"
+    managed_skill = stage / ".agents" / "skills" / "export-to-claude"
+    (managed_skill / "agents").mkdir(parents=True)
+    (managed_skill / "SKILL.md").write_text(
+        "---\nname: export-to-claude\n---\nconvo-porter inject --current --source codex --target claude\n",
+    )
+    (managed_skill / "agents" / "openai.yaml").write_text("interface: {}\n")
+    custom_skill = stage / ".agents" / "skills" / "export-to-codex"
+    custom_skill.mkdir(parents=True)
+    (custom_skill / "SKILL.md").write_text("name: export-to-codex\nmy own skill\n")
+    commands = stage / ".claude" / "commands"
+    commands.mkdir(parents=True)
+    (commands / "export-to-codex.md").write_text(
+        "---\nname: export-to-codex\n---\nconvo-porter inject --current --source claude --target codex\n",
+    )
+
+    result = delegated_install_result("install", "all", perform=True, install_root=str(stage))
+
+    assert not managed_skill.exists()
+    assert (custom_skill / "SKILL.md").exists()
+    assert not (commands / "export-to-codex.md").exists()
+    assert any("export:to-*" in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({"CLAUDECODE": "1"}, "claude"),
+        ({"CODEX_THREAD_ID": "thread-id"}, "codex"),
+        ({"CURSOR_AGENT_CHAT_ID": "chat-id"}, "cursor"),
+    ],
+)
+def test_detect_current_harness_uses_session_environment(environment, expected, monkeypatch):
+    for _, variable in convo_porter.HARNESS_ENVIRONMENT:
+        monkeypatch.delenv(variable, raising=False)
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+
+    assert convo_porter.detect_current_harness() == expected
+
+
+@pytest.mark.parametrize("environment", [{}, {"CLAUDECODE": "1", "CODEX_THREAD_ID": "thread-id"}])
+def test_detect_current_harness_requires_exactly_one_harness(environment, monkeypatch):
+    for _, variable in convo_porter.HARNESS_ENVIRONMENT:
+        monkeypatch.delenv(variable, raising=False)
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+
+    with pytest.raises(SystemExit):
+        convo_porter.detect_current_harness()
+
+
+def test_current_inject_without_source_exports_into_the_same_harness(monkeypatch, capsys):
+    for _, variable in convo_porter.HARNESS_ENVIRONMENT:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("CODEX_THREAD_ID", "source-id")
+    args = SimpleNamespace(
+        source=None, target="codex", session_id=None, current=True, tail=None,
+        into=None, max_tool_lines=50, include_thinking=False,
+    )
+    resolved = []
+    monkeypatch.setattr(convo_porter, "resolve_session", lambda session_id, current, source: (
+        resolved.append(source) or {
+            "session_id": "source-id", "source": source,
+            "path": "/tmp/source.jsonl", "project": "/tmp",
+        }
+    ))
+    monkeypatch.setattr(convo_porter, "parse_codex_session", lambda *a, **k: Conversation(
+        turns=[Turn(role="user", content="hello")],
+    ))
+    monkeypatch.setattr(
+        convo_porter, "write_as_codex_session", lambda *a, **k: ("new-id", "/tmp/new.jsonl"),
+    )
+
+    convo_porter.cmd_inject(args)
+
+    assert resolved == ["codex"]
+    assert "Open: codex resume new-id" in capsys.readouterr().out
+
+
+def test_inject_refuses_to_append_a_session_into_itself(monkeypatch):
+    args = SimpleNamespace(
+        source="codex", target="codex", session_id=None, current=True, tail=None,
+        into="source", max_tool_lines=50, include_thinking=False,
+    )
+    session = {
+        "session_id": "source-id", "source": "codex",
+        "path": "/tmp/source.jsonl", "project": "/tmp",
+    }
+    monkeypatch.setattr(convo_porter, "resolve_session", lambda *a, **k: session)
+    monkeypatch.setattr(convo_porter, "parse_codex_session", lambda *a, **k: Conversation(
+        turns=[Turn(role="user", content="hello")],
+    ))
+    monkeypatch.setattr(convo_porter, "_find_target_session", lambda *a, **k: dict(session))
+    monkeypatch.setattr(
+        convo_porter, "write_as_codex_session",
+        lambda *a, **k: pytest.fail("a session must not be appended into itself"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        convo_porter.cmd_inject(args)
+    assert exc.value.code == 1

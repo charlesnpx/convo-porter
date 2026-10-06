@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 
 import convo_porter
@@ -176,3 +177,93 @@ def test_codex_export_sanitizes_cursor_call_ids(tmp_path, monkeypatch):
     assert function_outputs[0]["call_id"] == expected_id
     assert function_calls[1]["call_id"] == valid_id
     assert function_outputs[1]["call_id"] == valid_id
+
+
+def _create_threads_table(db_path, extra_rows=()):
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = (
+            "id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, "
+            "source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, "
+            "approval_mode TEXT, tokens_used INTEGER, has_user_event INTEGER, archived INTEGER, "
+            "cli_version TEXT, first_user_message TEXT, memory_mode TEXT, thread_source TEXT, "
+            "created_at_ms INTEGER, updated_at_ms INTEGER, preview TEXT, recency_at INTEGER, "
+            "recency_at_ms INTEGER, history_mode TEXT"
+        )
+        connection.execute(f"CREATE TABLE threads ({columns})")
+        for thread_id, provider in extra_rows:
+            connection.execute(
+                "INSERT INTO threads (id, model_provider) VALUES (?, ?)", (thread_id, provider),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _registered_provider(db_path, session_id):
+    connection = sqlite3.connect(db_path)
+    try:
+        return connection.execute(
+            "SELECT model_provider FROM threads WHERE id = ?", (session_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+
+def test_register_codex_thread_uses_the_exporting_threads_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path)
+    monkeypatch.setenv("CODEX_THREAD_ID", "running-thread")
+    db_path = tmp_path / "state_5.sqlite"
+    _create_threads_table(db_path, [("running-thread", "pi_claude")])
+    (tmp_path / "config.toml").write_text('model_provider = "openai_http"\n')
+    conv = Conversation(turns=[Turn(role="user", content="hello")])
+
+    convo_porter._register_codex_thread("imported", tmp_path / "rollout.jsonl", conv)
+
+    assert _registered_provider(db_path, "imported") == "pi_claude"
+
+
+def test_register_codex_thread_falls_back_to_configured_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    db_path = tmp_path / "state_5.sqlite"
+    _create_threads_table(db_path)
+    (tmp_path / "config.toml").write_text(
+        'model = "gpt"\nmodel_provider = "openai_http"  # proxy\n\n'
+        '[profiles.other]\nmodel_provider = "ollama"\n',
+    )
+    conv = Conversation(turns=[Turn(role="user", content="hello")])
+
+    convo_porter._register_codex_thread("imported", tmp_path / "rollout.jsonl", conv)
+
+    assert _registered_provider(db_path, "imported") == "openai_http"
+
+
+def test_register_codex_thread_defaults_to_openai_without_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    db_path = tmp_path / "state_5.sqlite"
+    _create_threads_table(db_path)
+    conv = Conversation(turns=[Turn(role="user", content="hello")])
+
+    convo_porter._register_codex_thread("imported", tmp_path / "rollout.jsonl", conv)
+
+    assert _registered_provider(db_path, "imported") == "openai"
+
+
+def test_find_current_codex_session_prefers_codex_thread_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(convo_porter, "CODEX_DIR", tmp_path)
+    day = tmp_path / "sessions" / "2026" / "10" / "06"
+    day.mkdir(parents=True)
+    current = day / "rollout-2026-10-06T10-00-00-current-thread.jsonl"
+    newer = day / "rollout-2026-10-06T11-00-00-newer-thread.jsonl"
+    current.write_text(json.dumps({"type": "session_meta", "payload": {"id": "current-thread"}}) + "\n")
+    newer.write_text(json.dumps({"type": "session_meta", "payload": {"id": "newer-thread"}}) + "\n")
+    modified = current.stat().st_mtime
+    os.utime(newer, (modified + 60, modified + 60))
+
+    monkeypatch.setenv("CODEX_THREAD_ID", "current-thread")
+    assert convo_porter.find_current_codex_session()["session_id"] == "current-thread"
+
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    assert convo_porter.find_current_codex_session()["session_id"] == "newer-thread"
